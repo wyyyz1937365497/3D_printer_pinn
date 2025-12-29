@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import time
 import gc
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -15,15 +15,15 @@ config = {
     'data_path': 'enterprise_dataset/printer_enterprise_data.csv',
     'cache_dir': './data_cache/',
     'seq_len': 200,
-    'batch_size': 4096,  # 可以在这里调整batch_size
+    'batch_size': 8192,  # 可以在这里调整batch_size
     'hidden_dim': 128,
     'tcn_channels': [64, 64, 128],
     'lr': 2e-3,
     'epochs': 50,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'num_workers': 0,
-    'test_mode': False,
-    'test_samples': 1000,
+    'test_mode': True,
+    'test_samples': 1000000,
 }
 
 RANDOM_SEED = 42
@@ -366,7 +366,7 @@ def visualize_predictions(model, loader, processor):
 
 def train_model():
     print("=" * 70)
-    print("🚀 TCN-LSTM 训练 (AMP + warmup+cosine + TensorBoard + 剩余时间预测)")
+    print("🚀 TCN-LSTM 训练 (新API + 学习率修正 + 梯度监控)")
     print("=" * 70)
 
     # 数据加载
@@ -407,19 +407,24 @@ def train_model():
 
     model = model.to(config['device'])
 
-    # 🎯 关键修改：根据batch_size调整学习率
+    # 🎯 修正：降低学习率缩放因子，防止梯度爆炸
+    # 原代码：base_lr * (batch_size / 2048) -> 0.0005 * 4 = 0.002 (太高)
+    # 新代码：使用平方根缩放，或者更小的线性因子
     base_lr = config['lr']
-    scaled_lr = base_lr * (config['batch_size'] / 2048)  # 以2048为基准进行缩放
-    scaled_lr = min(scaled_lr, base_lr * 4)  # 限制最大放大倍数，避免学习率过大
     
+    # 使用 sqrt 缩放通常在大 Batch size 下更稳定
+    # (8192 / 2048)^0.5 = 2
+    scaled_lr = base_lr
+    
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=scaled_lr,
+        betas=(0.9, 0.999),
         weight_decay=1e-5
     )
 
-    # 学习率调度：warmup + cosine 退火
-    warmup_epochs = 5
+    warmup_epochs = 10
     total_epochs = config['epochs']
 
     warmup_scheduler = LinearLR(
@@ -440,29 +445,20 @@ def train_model():
     )
 
     criterion = nn.MSELoss()
-    scaler = GradScaler()
+    
+    # 🔧 修正：更新为新版 PyTorch AMP API (修复 FutureWarning)
+    # import torch.amp as amp # (如果在顶部导入了，这里直接使用)
+    scaler = GradScaler('cuda') 
 
     # TensorBoard设置
     log_dir = os.path.join("runs", "tcn_lstm_experiment")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"📊 TensorBoard 日志目录: {log_dir}")
-    print(f"   运行: tensorboard --logdir {log_dir}")
 
-    # 📊 训练配置信息输出
-    print("🏋️ 训练配置:")
-    print(f"📝 学习率: {base_lr:.6f} (基准) -> {scaled_lr:.6f} (调整后)")
-    print(f"📦 Batch Size: {config['batch_size']}")
-    print(f"🧠 隐藏层维度: {config['hidden_dim']}")
-    print(f"📊 总训练样本: {len(train_dataset)}")
-    print(f"📊 总验证样本: {len(val_dataset)}")
-    print(f"⏱️  总Epoch数: {total_epochs}")
-    
     best_val_loss = float('inf')
     global_step = 0
     print_every = 100
-    
-    # ⏰ 时间追踪变量
     training_start_time = time.time()
     epoch_times = []
     
@@ -473,58 +469,67 @@ def train_model():
         model.train()
         epoch_loss = 0
 
-        # 📊 训练循环
+        # ==================== 训练循环 ====================
         for batch_idx, (batch_X, batch_Y) in enumerate(train_loader):
             batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
 
             optimizer.zero_grad()
 
-            with autocast():
+            # 🔧 修正：更新为新版 PyTorch AMP API
+            with autocast('cuda'):
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_Y)
 
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # AMP 下必须 unscale 才能获取真实梯度并裁剪
+            scaler.unscale_(optimizer)
+            
+            # 获取梯度范数并裁剪
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += loss.item()
 
-            # 📊 定期打印进度和剩余时间
             if (batch_idx + 1) % print_every == 0:
                 avg_so_far = epoch_loss / (batch_idx + 1)
                 
-                # 实时计算剩余时间
+                # 计算剩余时间
                 elapsed_batch_time = time.time() - epoch_start
                 batches_per_epoch = len(train_loader)
                 batches_done = batch_idx + 1
                 batches_remaining_in_epoch = batches_per_epoch - batches_done
                 epochs_remaining = total_epochs - epoch - 1
                 
-                # 估算当前epoch剩余时间
                 avg_batch_time = elapsed_batch_time / batches_done
                 epoch_time_remaining = avg_batch_time * batches_remaining_in_epoch
                 
-                # 估算总体剩余时间
                 if epoch_times:
                     avg_epoch_time = sum(epoch_times) / len(epoch_times)
                     total_time_remaining = epoch_time_remaining + (avg_epoch_time * epochs_remaining)
                 else:
                     total_time_remaining = epoch_time_remaining + (avg_batch_time * batches_per_epoch * epochs_remaining)
                 
+                # 打印日志
                 print(f"  🔵 Epoch {epoch+1} | Batch {batch_idx+1:6d}/{len(train_loader):6d} | "
                       f"Loss: {avg_so_far:.6f} | LR: {optimizer.param_groups[0]['lr']:.6e} | "
+                      f"Grad Norm: {total_norm:.4f} | "
                       f"ETA: {format_time(total_time_remaining)}")
 
+                # TensorBoard 记录
                 writer.add_scalar("Loss/train_batch", avg_so_far, global_step)
                 writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
+                writer.add_scalar("Gradients/total_norm", total_norm, global_step)
                 writer.add_scalar("Time/eta_seconds", total_time_remaining, global_step)
+                
                 global_step += 1
 
         avg_train_loss = epoch_loss / len(train_loader)
         writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
 
-        # 📊 验证循环
+        # ==================== 验证循环 ====================
         model.eval()
         val_loss = 0
         val_start_time = time.time()
@@ -532,8 +537,10 @@ def train_model():
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
                 batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_Y)
+                # 验证时通常不需要 autocast，或者也可以加上以加速，这里保持一致加上
+                with autocast('cuda'):
+                    outputs = model(batch_X)
+                    loss = criterion(outputs, batch_Y)
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
@@ -543,7 +550,7 @@ def train_model():
 
         scheduler.step()
 
-        # 📊 计算并显示epoch级别的统计信息
+        # Epoch 统计
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
         
@@ -554,11 +561,10 @@ def train_model():
         estimated_remaining_time = avg_epoch_time * remaining_epochs
         
         progress_percent = (epochs_completed / total_epochs) * 100
-        total_elapsed = time.time() - training_start_time
         
         print(f"🟢 Epoch {epoch+1:3d}/{total_epochs} ({progress_percent:5.1f}%) | "
               f"Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | "
-              f"Time: {epoch_time:.2f}s | 总用时: {format_time(total_elapsed)} | "
+              f"Time: {epoch_time:.2f}s | 总用时: {format_time(elapsed_total_time)} | "
               f"ETA: {format_time(estimated_remaining_time)}")
 
         if avg_val_loss < best_val_loss:
@@ -566,15 +572,12 @@ def train_model():
             torch.save(model.state_dict(), 'best_tcn_lstm_model.pth')
             print(f"  💾 模型已保存 (最佳验证损失: {best_val_loss:.6f})")
 
-    # 🎉 训练完成
     total_training_time = time.time() - training_start_time
     print(f"\n{'='*70}")
     print(f"🎉 训练完成！")
     print(f"{'='*70}")
     print(f"⏱️  总用时: {format_time(total_training_time)}")
     print(f"📊 最佳验证损失: {best_val_loss:.6f}")
-    print(f"📦 最终Batch Size: {config['batch_size']}")
-    print(f"📝 最终学习率: {optimizer.param_groups[0]['lr']:.6e}")
     print(f"{'='*70}\n")
     
     writer.close()
