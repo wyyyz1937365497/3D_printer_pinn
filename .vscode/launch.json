@@ -1,0 +1,16 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python train_pinn",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${cwd}/train_pinn.py",
+            "console": "integratedTerminal",
+            "args": "--num_machines 50 --num_phy 20000 --epochs 2000 --hidden_dim 64 --num_layers 3 --lr 1e-3 --lambda_data 1.0 --lambda_phy 0.1 --log_interval 100"
+        },
+    ]
+}
