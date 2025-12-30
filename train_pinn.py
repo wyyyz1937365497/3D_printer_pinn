@@ -27,7 +27,7 @@ class Config:
         self.lr = 3e-4
         self.epochs = 50
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.num_workers = 0
+        self.num_workers = 4
         self.max_samples = 500000
         self.lambda_physics = 0.1
         self.warmup_epochs = 10
@@ -448,8 +448,11 @@ def train_pinn_model(config):
                 # 数据拟合损失
                 data_loss = criterion(outputs, batch_Y)
                 
-                # 物理约束损失
-                physics_loss = model.physics_loss(outputs, batch_Y)
+                # 物理约束损失 - 针对DataParallel模型的正确访问方式
+                if isinstance(model, nn.DataParallel):
+                    physics_loss = model.module.physics_loss(outputs, batch_Y)
+                else:
+                    physics_loss = model.physics_loss(outputs, batch_Y)
                 
                 # 总损失
                 total_loss = data_loss + config.lambda_physics * physics_loss
