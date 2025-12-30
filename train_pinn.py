@@ -13,51 +13,43 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 # ==================== 配置参数 ====================
 config = {
     'data_path': 'enterprise_dataset/printer_enterprise_data.csv',
-    'cache_dir': './data_cache/',
     'seq_len': 200,
-    'batch_size': 8192,  # 可以在这里调整batch_size
-    
-    # 🚀 模型架构增强参数
-    'hidden_dim': 256,          # 从 128 增加到 256
-    'tcn_channels': [128, 128, 256], # 从 [64, 64, 128] 增加到 [128, 128, 256]
-    
-    'lr': 2e-3,
-    'epochs': 50,
+    'batch_size': 2048,  # 增加批量大小以提高训练速度
+    'gradient_accumulation_steps': 1,  # 梯度累积平衡内存和速度
+    'model_dim': 256,    # 保持模型维度
+    'num_heads': 8,      # 保持注意力头数
+    'num_layers': 6,     # 保持Transformer层数
+    'dim_feedforward': 1024,  # 保持前馈网络维度
+    'dropout': 0.1,
+    'lr': 5e-4,         # 增加学习率加速收敛
+    'epochs': 10,       # 大幅减少训练轮数（快速观察）
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'num_workers': 0,
-    
-    # 🚀 数据集限制：直接限制最大样本数，不再使用 test_mode 开关
-    'max_samples': 2000000,    # 限制数据集数量 (例如 200万)
+    'max_samples': 500000,  # 减少样本数量（快速处理）
 }
 
 RANDOM_SEED = 42
 rng = np.random.default_rng(RANDOM_SEED)
 
 # ==================== 数据处理器类 ====================
-class ShuffledOnceDataProcessor:
-    """数据处理器 - 移除 test_mode，直接使用 max_samples"""
-    def __init__(self, data_path, seq_len, cache_dir, max_samples):
+class MemoryDataProcessor:
+    """数据处理器 - 直接加载到内存，不使用memmap"""
+    def __init__(self, data_path, seq_len, max_samples):
         self.data_path = data_path
         self.seq_len = seq_len
-        self.cache_dir = cache_dir
-        self.max_samples = max_samples  # 直接使用样本数限制
+        self.max_samples = max_samples
 
         self.input_cols = ['ctrl_T_target', 'ctrl_speed_set', 'ctrl_heater_base']
         self.target_cols = ['temperature_C', 'vibration_disp_m', 'vibration_vel_m_s',
                            'motor_current_A', 'pressure_bar', 'acoustic_signal']
 
-        if os.path.exists(cache_dir) and os.listdir(cache_dir):
-            print(f"📦 发现缓存目录: {cache_dir}")
-            self.load_metadata()
-        else:
-            print(f"🔄 缓存不存在，开始处理数据...")
-            print(f"🚀 缓存将写入: {cache_dir}")
-            print(f"⚙️  最大样本限制: {self.max_samples}")
-            os.makedirs(cache_dir, exist_ok=True)
-            self.process_and_save()
+        print(f"🔄 开始处理数据...")
+        print(f"🚀 数据将直接加载到内存中")
+        print(f"⚙️  最大样本限制: {self.max_samples}")
+        self.process_data()
 
-    def process_and_save(self):
-        """预处理数据并保存"""
+    def process_data(self):
+        """预处理数据并直接加载到内存"""
         df = pd.read_csv(self.data_path)
         print(f"✅ 原始数据加载: {df.shape}")
 
@@ -86,7 +78,6 @@ class ShuffledOnceDataProcessor:
             n_windows = total_len - self.seq_len
 
             for i in range(n_windows):
-                # 🔥 核心修改：直接判断是否达到 max_samples，不再依赖 test_mode 布尔值
                 if count >= self.max_samples:
                     break
                     
@@ -138,47 +129,15 @@ class ShuffledOnceDataProcessor:
         train_sample_indices = list(train_sample_indices)
         rng.shuffle(train_sample_indices)
 
-        # 保存归一化参数
-        print("💾 保存归一化参数")
-        scaler_path = os.path.join(self.cache_dir, 'scaler_stats.npz')
-        np.savez(scaler_path,
-                 mean_X=self.mean_X, std_X=self.std_X,
-                 mean_Y=self.mean_Y, std_Y=self.std_Y)
-        print(f"   已保存至: {scaler_path}")
+        # Pass 2: 直接加载到内存
+        print("📊 [Pass 2/2] 直接加载到内存...")
+        start_time = time.time()
 
-        # 保存样本索引
-        indices_path = os.path.join(self.cache_dir, 'sample_indices.npz')
-        np.savez(indices_path,
-                 train_sample_indices=np.array(train_sample_indices, dtype=object),
-                 val_sample_indices=np.array(val_sample_indices, dtype=object))
-        print(f"   样本索引已保存至: {indices_path}")
-
-        # Pass 2: 写入memmap
-        print("💾 [Pass 2/2] 按 train/val 索引顺序写入 memmap 缓存文件...")
-
-        mmap_files = {
-            'train_X': os.path.join(self.cache_dir, 'train_X.npy'),
-            'train_Y': os.path.join(self.cache_dir, 'train_Y.npy'),
-            'val_X': os.path.join(self.cache_dir, 'val_X.npy'),
-            'val_Y': os.path.join(self.cache_dir, 'val_Y.npy'),
-        }
-
-        self.train_X = np.lib.format.open_memmap(
-            mmap_files['train_X'], dtype='float32', mode='w+',
-            shape=(self.train_len, self.seq_len, len(self.input_cols))
-        )
-        self.train_Y = np.lib.format.open_memmap(
-            mmap_files['train_Y'], dtype='float32', mode='w+',
-            shape=(self.train_len, len(self.target_cols))
-        )
-        self.val_X = np.lib.format.open_memmap(
-            mmap_files['val_X'], dtype='float32', mode='w+',
-            shape=(self.val_len, self.seq_len, len(self.input_cols))
-        )
-        self.val_Y = np.lib.format.open_memmap(
-            mmap_files['val_Y'], dtype='float32', mode='w+',
-            shape=(self.val_len, len(self.target_cols))
-        )
+        # 初始化内存数组
+        self.train_X = np.zeros((self.train_len, self.seq_len, len(self.input_cols)), dtype=np.float32)
+        self.train_Y = np.zeros((self.train_len, len(self.target_cols)), dtype=np.float32)
+        self.val_X = np.zeros((self.val_len, self.seq_len, len(self.input_cols)), dtype=np.float32)
+        self.val_Y = np.zeros((self.val_len, len(self.target_cols)), dtype=np.float32)
 
         train_ptr = 0
         val_ptr = 0
@@ -216,112 +175,85 @@ class ShuffledOnceDataProcessor:
         write_samples(train_sample_indices, is_train=True)
         write_samples(val_sample_indices, is_train=False)
 
-        print("✅ 缓存写入完成！")
-
-        del self.train_X, self.train_Y, self.val_X, self.val_Y
-        gc.collect()
-
-        self.load_metadata()
-
-    def load_metadata(self):
-        """加载缓存的元数据"""
-        scaler_path = os.path.join(self.cache_dir, 'scaler_stats.npz')
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"找不到 Scaler 文件: {scaler_path}")
-
-        data = np.load(scaler_path)
-        self.mean_X = data['mean_X']
-        self.std_X = data['std_X']
-        self.mean_Y = data['mean_Y']
-        self.std_Y = data['std_Y']
-        print("✅ 归一化参数加载成功")
-
-        self.train_X = np.load(os.path.join(self.cache_dir, 'train_X.npy'), mmap_mode='r')
-        self.train_Y = np.load(os.path.join(self.cache_dir, 'train_Y.npy'), mmap_mode='r')
-        self.val_X = np.load(os.path.join(self.cache_dir, 'val_X.npy'), mmap_mode='r')
-        self.val_Y = np.load(os.path.join(self.cache_dir, 'val_Y.npy'), mmap_mode='r')
-
-        self.train_len = self.train_X.shape[0]
-        self.val_len = self.val_X.shape[0]
-        self.total_samples = self.train_len + self.val_len
-        print(f"✅ 数据映射加载成功: Train {self.train_len}, Val {self.val_len}")
+        print(f"✅ 数据加载完成！内存占用: {self.train_X.nbytes / (1024**3):.2f} GB")
+        print(f"   耗时: {time.time() - start_time:.2f}s")
 
     def inverse_transform_y(self, y_norm):
         """反归一化"""
         return y_norm * self.std_Y + self.mean_Y
 
 
-class MMapDataset(Dataset):
-    def __init__(self, X_mmap, Y_mmap):
-        self.X = X_mmap
-        self.Y = Y_mmap
+class MemoryDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = torch.from_numpy(X)
+        self.Y = torch.from_numpy(Y)
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        return self.X[idx].copy(), self.Y[idx].copy()
+        return self.X[idx], self.Y[idx]
 
 
 # ==================== 模型定义 ====================
-class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
-        super(TemporalBlock, self).__init__()
-        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                              stride=stride, padding=padding, dilation=dilation)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-        self.net = nn.Sequential(self.conv1, self.relu1, self.dropout1)
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.relu = nn.ReLU()
-        self.kernel_size = kernel_size
-        self.dilation = dilation
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        out = self.net(x)
-        pad = (self.kernel_size - 1) * self.dilation
-        out = out[:, :, :-pad]
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+        return x + self.pe[:, :x.size(1), :]
 
 
-class TCN(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=3, dropout=0.2):
-        super(TCN, self).__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation_size = 2 ** i
-            in_channels = num_inputs if i == 0 else num_channels[i - 1]
-            out_channels = num_channels[i]
-            padding = (kernel_size - 1) * dilation_size
-            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1,
-                                   dilation=dilation_size, padding=padding, dropout=dropout)]
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        out = self.network(x)
-        return out.transpose(1, 2)
-
-
-class TCNLSTMModel(nn.Module):
-    def __init__(self, input_dim, tcn_channels, hidden_dim, output_dim):
-        super(TCNLSTMModel, self).__init__()
-        # TCN 部分使用配置中的通道数
-        self.tcn = TCN(input_dim, tcn_channels)
-        tcn_output_dim = tcn_channels[-1]
+class TimeSeriesTransformer(nn.Module):
+    """时间序列Transformer模型"""
+    def __init__(self, input_dim, output_dim, seq_len=200):
+        super(TimeSeriesTransformer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.seq_len = seq_len
         
-        # 🔥 架构调整：LSTM 层数增加到 3，Dropout 稍微增加到 0.2
-        self.lstm = nn.LSTM(tcn_output_dim, hidden_dim, num_layers=3,
-                           batch_first=True, dropout=0.2, bidirectional=False)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        # 输入投影层
+        self.input_proj = nn.Linear(input_dim, config['model_dim'])
+        
+        # 位置编码
+        self.pos_encoder = PositionalEncoding(config['model_dim'], seq_len)
+        
+        # Transformer编码器
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config['model_dim'],
+            nhead=config['num_heads'],
+            dim_feedforward=config['dim_feedforward'],
+            dropout=config['dropout'],
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config['num_layers'])
+        
+        # 输出层
+        self.fc = nn.Linear(config['model_dim'], output_dim)
 
     def forward(self, x):
-        tcn_out = self.tcn(x)
-        lstm_out, (h_n, c_n) = self.lstm(tcn_out)
-        last_step_out = lstm_out[:, -1, :]
-        prediction = self.fc(last_step_out)
+        # 输入投影
+        x = self.input_proj(x)
+        
+        # 添加位置编码
+        x = self.pos_encoder(x)
+        
+        # Transformer处理
+        x = self.transformer(x)
+        
+        # 取最后一个时间步的输出
+        x = x[:, -1, :]
+        
+        # 输出层
+        prediction = self.fc(x)
         return prediction
 
 
@@ -371,20 +303,18 @@ def visualize_predictions(model, loader, processor):
 
 def train_model():
     print("=" * 70)
-    print("🚀 TCN-LSTM 训练 (增强版架构)")
+    print("🚀 TimeSeriesTransformer 快速训练 (10轮)")
     print("=" * 70)
 
     # 数据加载
-    # 🔥 修改：移除 test_mode 参数，直接传入 max_samples
-    processor = ShuffledOnceDataProcessor(
+    processor = MemoryDataProcessor(
         config['data_path'],
         config['seq_len'],
-        config['cache_dir'],
-        max_samples=config['max_samples']
+        config['max_samples']
     )
 
-    train_dataset = MMapDataset(processor.train_X, processor.train_Y)
-    val_dataset = MMapDataset(processor.val_X, processor.val_Y)
+    train_dataset = MemoryDataset(processor.train_X, processor.train_Y)
+    val_dataset = MemoryDataset(processor.val_X, processor.val_Y)
 
     train_loader = DataLoader(
         train_dataset,
@@ -404,8 +334,8 @@ def train_model():
     input_dim = len(processor.input_cols)
     output_dim = len(processor.target_cols)
 
-    # 🔥 模型实例化：使用 config 中增强后的参数
-    model = TCNLSTMModel(input_dim, config['tcn_channels'], config['hidden_dim'], output_dim)
+    # 使用完整的Transformer模型
+    model = TimeSeriesTransformer(input_dim, output_dim, config['seq_len'])
 
     if torch.cuda.device_count() > 1:
         print(f"🎮 使用 {torch.cuda.device_count()} 个 GPU!")
@@ -414,7 +344,7 @@ def train_model():
     model = model.to(config['device'])
 
     base_lr = config['lr']
-    scaled_lr = base_lr # 保持与原逻辑一致或根据需要调整
+    scaled_lr = base_lr
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -423,7 +353,7 @@ def train_model():
         weight_decay=1e-5
     )
 
-    warmup_epochs = 10
+    warmup_epochs = 3  # 减少warmup轮数
     total_epochs = config['epochs']
 
     warmup_scheduler = LinearLR(
@@ -447,14 +377,14 @@ def train_model():
     scaler = GradScaler('cuda') 
 
     # TensorBoard设置
-    log_dir = os.path.join("runs", "tcn_lstm_experiment_large")
+    log_dir = os.path.join("runs", "transformer_experiment_fast")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"📊 TensorBoard 日志目录: {log_dir}")
 
     best_val_loss = float('inf')
     global_step = 0
-    print_every = 100
+    print_every = 50  # 减少打印频率
     training_start_time = time.time()
     epoch_times = []
     
@@ -464,27 +394,27 @@ def train_model():
         epoch_start = time.time()
         model.train()
         epoch_loss = 0
+        optimizer.zero_grad()  # 重置梯度
 
         # ==================== 训练循环 ====================
         for batch_idx, (batch_X, batch_Y) in enumerate(train_loader):
             batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
 
-            optimizer.zero_grad()
-
             with autocast('cuda'):
                 outputs = model(batch_X)
-                loss = criterion(outputs, batch_Y)
-
+                loss = criterion(outputs, batch_Y) / config['gradient_accumulation_steps']
+            
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
             
-            # 获取梯度范数并裁剪
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            
-            scaler.step(optimizer)
-            scaler.update()
+            # 梯度累积
+            if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
+                scaler.unscale_(optimizer)
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * config['gradient_accumulation_steps']
 
             if (batch_idx + 1) % print_every == 0:
                 avg_so_far = epoch_loss / (batch_idx + 1)
@@ -561,12 +491,12 @@ def train_model():
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), 'best_tcn_lstm_model.pth')
+            torch.save(model.state_dict(), 'best_transformer_model_fast.pth')
             print(f"  💾 模型已保存 (最佳验证损失: {best_val_loss:.6f})")
 
     total_training_time = time.time() - training_start_time
     print(f"\n{'='*70}")
-    print(f"🎉 训练完成！")
+    print(f"🎉 快速训练完成！")
     print(f"{'='*70}")
     print(f"⏱️  总用时: {format_time(total_training_time)}")
     print(f"📊 最佳验证损失: {best_val_loss:.6f}")
@@ -574,9 +504,6 @@ def train_model():
     
     writer.close()
 
-    # 可视化：这里不再依赖 config['test_mode']，因为数据量可能较大，
-    # 如果需要可视化，建议在验证集上抽取一小部分进行展示，或者仅在小数据集开启。
-    # 为保持兼容性，这里保留调用，但在数据量过大时请注意显存或时间。
     print("📊 生成预测可视化图表...")
     visualize_predictions(model, val_loader, processor)
 
