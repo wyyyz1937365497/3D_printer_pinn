@@ -1,2 +1,3 @@
 enterprise_dataset/printer_enterprise_data.csv
 data_cache/
+*.pth
