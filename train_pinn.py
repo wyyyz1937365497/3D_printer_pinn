@@ -16,31 +16,31 @@ config = {
     'cache_dir': './data_cache/',
     'seq_len': 200,
     'batch_size': 8192,  # 可以在这里调整batch_size
-    'hidden_dim': 128,
-    'tcn_channels': [64, 64, 128],
+    
+    # 🚀 模型架构增强参数
+    'hidden_dim': 256,          # 从 128 增加到 256
+    'tcn_channels': [128, 128, 256], # 从 [64, 64, 128] 增加到 [128, 128, 256]
+    
     'lr': 2e-3,
     'epochs': 50,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'num_workers': 0,
-    'test_mode': True,
-    'test_samples': 1000000,
+    
+    # 🚀 数据集限制：直接限制最大样本数，不再使用 test_mode 开关
+    'max_samples': 2000000,    # 限制数据集数量 (例如 200万)
 }
 
 RANDOM_SEED = 42
 rng = np.random.default_rng(RANDOM_SEED)
 
 # ==================== 数据处理器类 ====================
-# (这里保持原有的 ShuffledOnceDataProcessor 类不变)
-# 为了简洁，我会在下面提供完整的修改
-
 class ShuffledOnceDataProcessor:
-    """数据处理器 - 与之前相同"""
-    def __init__(self, data_path, seq_len, cache_dir, test_mode=False, test_samples=1000):
+    """数据处理器 - 移除 test_mode，直接使用 max_samples"""
+    def __init__(self, data_path, seq_len, cache_dir, max_samples):
         self.data_path = data_path
         self.seq_len = seq_len
         self.cache_dir = cache_dir
-        self.test_mode = test_mode
-        self.test_samples = test_samples
+        self.max_samples = max_samples  # 直接使用样本数限制
 
         self.input_cols = ['ctrl_T_target', 'ctrl_speed_set', 'ctrl_heater_base']
         self.target_cols = ['temperature_C', 'vibration_disp_m', 'vibration_vel_m_s',
@@ -52,6 +52,7 @@ class ShuffledOnceDataProcessor:
         else:
             print(f"🔄 缓存不存在，开始处理数据...")
             print(f"🚀 缓存将写入: {cache_dir}")
+            print(f"⚙️  最大样本限制: {self.max_samples}")
             os.makedirs(cache_dir, exist_ok=True)
             self.process_and_save()
 
@@ -85,6 +86,10 @@ class ShuffledOnceDataProcessor:
             n_windows = total_len - self.seq_len
 
             for i in range(n_windows):
+                # 🔥 核心修改：直接判断是否达到 max_samples，不再依赖 test_mode 布尔值
+                if count >= self.max_samples:
+                    break
+                    
                 x_win = X_raw[i:i + self.seq_len]
                 y_win = Y_raw[i + self.seq_len]
 
@@ -95,11 +100,8 @@ class ShuffledOnceDataProcessor:
 
                 sample_indices.append((machine_id, i))
                 count += 1
-
-                if self.test_mode and count >= self.test_samples:
-                    break
-
-            if self.test_mode and count >= self.test_samples:
+            
+            if count >= self.max_samples:
                 break
 
         # 计算均值和标准差
@@ -118,7 +120,7 @@ class ShuffledOnceDataProcessor:
         self.std_Y[self.std_Y < 1e-8] = 1.0
 
         self.total_samples = count
-        print(f"   样本总数: {self.total_samples}")
+        print(f"   实际处理样本总数: {self.total_samples}")
         print(f"   耗时: {time.time() - start_time:.2f}s")
 
         # 划分数据集
@@ -306,10 +308,13 @@ class TCN(nn.Module):
 class TCNLSTMModel(nn.Module):
     def __init__(self, input_dim, tcn_channels, hidden_dim, output_dim):
         super(TCNLSTMModel, self).__init__()
+        # TCN 部分使用配置中的通道数
         self.tcn = TCN(input_dim, tcn_channels)
         tcn_output_dim = tcn_channels[-1]
-        self.lstm = nn.LSTM(tcn_output_dim, hidden_dim, num_layers=2,
-                           batch_first=True, dropout=0.1, bidirectional=False)
+        
+        # 🔥 架构调整：LSTM 层数增加到 3，Dropout 稍微增加到 0.2
+        self.lstm = nn.LSTM(tcn_output_dim, hidden_dim, num_layers=3,
+                           batch_first=True, dropout=0.2, bidirectional=False)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
@@ -329,7 +334,7 @@ def format_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-# ==================== 训练与可视化（带剩余时间预测） ====================
+# ==================== 训练与可视化 ====================
 def visualize_predictions(model, loader, processor):
     """可视化预测结果"""
     import matplotlib.pyplot as plt
@@ -366,16 +371,16 @@ def visualize_predictions(model, loader, processor):
 
 def train_model():
     print("=" * 70)
-    print("🚀 TCN-LSTM 训练 (新API + 学习率修正 + 梯度监控)")
+    print("🚀 TCN-LSTM 训练 (增强版架构)")
     print("=" * 70)
 
     # 数据加载
+    # 🔥 修改：移除 test_mode 参数，直接传入 max_samples
     processor = ShuffledOnceDataProcessor(
         config['data_path'],
         config['seq_len'],
         config['cache_dir'],
-        test_mode=config['test_mode'],
-        test_samples=config['test_samples']
+        max_samples=config['max_samples']
     )
 
     train_dataset = MMapDataset(processor.train_X, processor.train_Y)
@@ -399,6 +404,7 @@ def train_model():
     input_dim = len(processor.input_cols)
     output_dim = len(processor.target_cols)
 
+    # 🔥 模型实例化：使用 config 中增强后的参数
     model = TCNLSTMModel(input_dim, config['tcn_channels'], config['hidden_dim'], output_dim)
 
     if torch.cuda.device_count() > 1:
@@ -407,15 +413,8 @@ def train_model():
 
     model = model.to(config['device'])
 
-    # 🎯 修正：降低学习率缩放因子，防止梯度爆炸
-    # 原代码：base_lr * (batch_size / 2048) -> 0.0005 * 4 = 0.002 (太高)
-    # 新代码：使用平方根缩放，或者更小的线性因子
     base_lr = config['lr']
-    
-    # 使用 sqrt 缩放通常在大 Batch size 下更稳定
-    # (8192 / 2048)^0.5 = 2
-    scaled_lr = base_lr
-    
+    scaled_lr = base_lr # 保持与原逻辑一致或根据需要调整
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -445,13 +444,10 @@ def train_model():
     )
 
     criterion = nn.MSELoss()
-    
-    # 🔧 修正：更新为新版 PyTorch AMP API (修复 FutureWarning)
-    # import torch.amp as amp # (如果在顶部导入了，这里直接使用)
     scaler = GradScaler('cuda') 
 
     # TensorBoard设置
-    log_dir = os.path.join("runs", "tcn_lstm_experiment")
+    log_dir = os.path.join("runs", "tcn_lstm_experiment_large")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"📊 TensorBoard 日志目录: {log_dir}")
@@ -475,14 +471,11 @@ def train_model():
 
             optimizer.zero_grad()
 
-            # 🔧 修正：更新为新版 PyTorch AMP API
             with autocast('cuda'):
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_Y)
 
             scaler.scale(loss).backward()
-            
-            # AMP 下必须 unscale 才能获取真实梯度并裁剪
             scaler.unscale_(optimizer)
             
             # 获取梯度范数并裁剪
@@ -537,7 +530,6 @@ def train_model():
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
                 batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
-                # 验证时通常不需要 autocast，或者也可以加上以加速，这里保持一致加上
                 with autocast('cuda'):
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_Y)
@@ -582,9 +574,11 @@ def train_model():
     
     writer.close()
 
-    if not config['test_mode']:
-        print("📊 生成预测可视化图表...")
-        visualize_predictions(model, val_loader, processor)
+    # 可视化：这里不再依赖 config['test_mode']，因为数据量可能较大，
+    # 如果需要可视化，建议在验证集上抽取一小部分进行展示，或者仅在小数据集开启。
+    # 为保持兼容性，这里保留调用，但在数据量过大时请注意显存或时间。
+    print("📊 生成预测可视化图表...")
+    visualize_predictions(model, val_loader, processor)
 
 
 if __name__ == "__main__":
