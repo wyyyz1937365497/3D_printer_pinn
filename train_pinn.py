@@ -6,34 +6,61 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import time
 import gc
+import argparse
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+import pickle
 
 # ==================== 配置参数 ====================
-config = {
-    'data_path': 'enterprise_dataset/printer_enterprise_data.csv',
-    'seq_len': 200,
-    'batch_size': 2048,  # 增加批量大小以提高训练速度
-    'gradient_accumulation_steps': 1,  # 梯度累积平衡内存和速度
-    'model_dim': 256,    # 保持模型维度
-    'num_heads': 8,      # 保持注意力头数
-    'num_layers': 6,     # 保持Transformer层数
-    'dim_feedforward': 1024,  # 保持前馈网络维度
-    'dropout': 0.1,
-    'lr': 5e-4,         # 增加学习率加速收敛
-    'epochs': 10,       # 大幅减少训练轮数（快速观察）
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'num_workers': 0,
-    'max_samples': 500000,  # 减少样本数量（快速处理）
-}
+class Config:
+    def __init__(self):
+        self.data_path = 'enterprise_dataset/printer_enterprise_data.csv'
+        self.seq_len = 200
+        self.batch_size = 2048
+        self.gradient_accumulation_steps = 2
+        self.model_dim = 256
+        self.num_heads = 8
+        self.num_layers = 6
+        self.dim_feedforward = 1024
+        self.dropout = 0.1
+        self.lr = 3e-4
+        self.epochs = 50
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.num_workers = 0
+        self.max_samples = 500000
+        self.lambda_physics = 0.1
+        self.warmup_epochs = 10
+        self.checkpoint_dir = './checkpoints'
+        self.resume_from = None  # 用于继续训练的检查点路径
 
-RANDOM_SEED = 42
-rng = np.random.default_rng(RANDOM_SEED)
+# ==================== 物理约束函数 ====================
+def thermal_conduction_loss(y_pred, y_true, dt=1.0):
+    """热传导损失：温度变化率约束"""
+    temp_pred = y_pred[:, 0]
+    temp_true = y_true[:, 0]
+    dT_pred = torch.diff(temp_pred, dim=0)
+    dT_true = torch.diff(temp_true, dim=0)
+    return torch.mean((dT_pred - dT_true) ** 2)
+
+def vibration_physics_loss(y_pred, y_true):
+    """振动物理约束：能量守恒"""
+    disp_pred = y_pred[:, 1]
+    vel_pred = y_pred[:, 2]
+    approx_vel = torch.diff(disp_pred, dim=0)
+    return torch.mean((vel_pred[1:] - approx_vel) ** 2)
+
+def current_physics_loss(y_pred, y_true):
+    """电机电流物理约束：功率关系"""
+    current_pred = y_pred[:, 3]
+    temp_pred = y_pred[:, 0]
+    vel_pred = y_pred[:, 2]
+    expected_current = temp_pred * vel_pred
+    return torch.mean((current_pred - expected_current) ** 2)
 
 # ==================== 数据处理器类 ====================
 class MemoryDataProcessor:
-    """数据处理器 - 直接加载到内存，不使用memmap"""
+    """数据处理器 - 直接加载到内存"""
     def __init__(self, data_path, seq_len, max_samples):
         self.data_path = data_path
         self.seq_len = seq_len
@@ -41,7 +68,7 @@ class MemoryDataProcessor:
 
         self.input_cols = ['ctrl_T_target', 'ctrl_speed_set', 'ctrl_heater_base']
         self.target_cols = ['temperature_C', 'vibration_disp_m', 'vibration_vel_m_s',
-                           'motor_current_A', 'pressure_bar', 'acoustic_signal']
+                          'motor_current_A', 'pressure_bar', 'acoustic_signal']
 
         print(f"🔄 开始处理数据...")
         print(f"🚀 数据将直接加载到内存中")
@@ -127,7 +154,8 @@ class MemoryDataProcessor:
         # Shuffle训练集索引
         print("🔀 对训练集样本索引做全局 shuffle...")
         train_sample_indices = list(train_sample_indices)
-        rng.shuffle(train_sample_indices)
+        import random
+        random.shuffle(train_sample_indices)
 
         # Pass 2: 直接加载到内存
         print("📊 [Pass 2/2] 直接加载到内存...")
@@ -182,7 +210,7 @@ class MemoryDataProcessor:
         """反归一化"""
         return y_norm * self.std_Y + self.mean_Y
 
-
+# ==================== 数据集类 ====================
 class MemoryDataset(Dataset):
     def __init__(self, X, Y):
         self.X = torch.from_numpy(X)
@@ -193,7 +221,6 @@ class MemoryDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.Y[idx]
-
 
 # ==================== 模型定义 ====================
 class PositionalEncoding(nn.Module):
@@ -211,33 +238,32 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1), :]
 
-
-class TimeSeriesTransformer(nn.Module):
-    """时间序列Transformer模型"""
+class PrinterPINN(nn.Module):
+    """3D打印机物理信息神经网络"""
     def __init__(self, input_dim, output_dim, seq_len=200):
-        super(TimeSeriesTransformer, self).__init__()
+        super(PrinterPINN, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.seq_len = seq_len
         
         # 输入投影层
-        self.input_proj = nn.Linear(input_dim, config['model_dim'])
+        self.input_proj = nn.Linear(input_dim, config.model_dim)
         
         # 位置编码
-        self.pos_encoder = PositionalEncoding(config['model_dim'], seq_len)
+        self.pos_encoder = PositionalEncoding(config.model_dim, seq_len)
         
         # Transformer编码器
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config['model_dim'],
-            nhead=config['num_heads'],
-            dim_feedforward=config['dim_feedforward'],
-            dropout=config['dropout'],
+            d_model=config.model_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config['num_layers'])
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         
         # 输出层
-        self.fc = nn.Linear(config['model_dim'], output_dim)
+        self.fc = nn.Linear(config.model_dim, output_dim)
 
     def forward(self, x):
         # 输入投影
@@ -256,8 +282,22 @@ class TimeSeriesTransformer(nn.Module):
         prediction = self.fc(x)
         return prediction
 
+    def physics_loss(self, y_pred, y_true):
+        """计算物理约束损失"""
+        loss = 0.0
+        
+        # 热传导约束
+        loss += thermal_conduction_loss(y_pred, y_true)
+        
+        # 振动物理约束
+        loss += vibration_physics_loss(y_pred, y_true)
+        
+        # 电流物理约束
+        loss += current_physics_loss(y_pred, y_true)
+        
+        return loss
 
-# ==================== 时间格式化函数 ====================
+# ==================== 工具函数 ====================
 def format_time(seconds):
     """格式化时间为 HH:MM:SS"""
     hours = int(seconds // 3600)
@@ -265,52 +305,46 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+def save_checkpoint(epoch, model, optimizer, scheduler, train_loss, val_loss, best_val_loss, config, filename):
+    """保存训练检查点"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'config': config.__dict__
+    }
+    torch.save(checkpoint, filename)
+    print(f"💾 检查点已保存至: {filename}")
+
+def load_checkpoint(filename, model, optimizer, scheduler, config):
+    """加载训练检查点"""
+    if os.path.exists(filename):
+        checkpoint = torch.load(filename)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        config.__dict__.update(checkpoint['config'])
+        return checkpoint['epoch'], checkpoint['train_loss'], checkpoint['val_loss'], checkpoint['best_val_loss']
+    return 0, 0, 0, float('inf')
 
 # ==================== 训练与可视化 ====================
-def visualize_predictions(model, loader, processor):
-    """可视化预测结果"""
-    import matplotlib.pyplot as plt
-
-    model.eval()
-    with torch.no_grad():
-        for batch_X, batch_Y in loader:
-            batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
-            preds = model(batch_X)
-            break
-
-    preds_np = preds.cpu().numpy()
-    targets_np = batch_Y.cpu().numpy()
-
-    preds_real = processor.inverse_transform_y(preds_np)
-    targets_real = processor.inverse_transform_y(targets_np)
-
-    plt.figure(figsize=(12, 8))
-    for i in range(6):
-        plt.subplot(3, 2, i + 1)
-        plt.plot(targets_real[:100, i], label='Ground Truth', alpha=0.7)
-        plt.plot(preds_real[:100, i], label='Prediction', linestyle='--')
-        plt.title(f'Feature: {processor.target_cols[i]}')
-        plt.legend()
-        plt.grid(True)
-    plt.tight_layout()
-
-    os.makedirs('image', exist_ok=True)
-    image_path = os.path.join('image', 'prediction_visualization.png')
-    plt.savefig(image_path)
-    print(f"📊 可视化图片已保存至: {image_path}")
-    plt.show()
-
-
-def train_model():
+def train_pinn_model(config):
     print("=" * 70)
-    print("🚀 TimeSeriesTransformer 快速训练 (10轮)")
+    print("🚀 PrinterPINN 训练 (物理信息神经网络)")
     print("=" * 70)
+
+    # 创建检查点目录
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     # 数据加载
     processor = MemoryDataProcessor(
-        config['data_path'],
-        config['seq_len'],
-        config['max_samples']
+        config.data_path,
+        config.seq_len,
+        config.max_samples
     )
 
     train_dataset = MemoryDataset(processor.train_X, processor.train_Y)
@@ -318,79 +352,87 @@ def train_model():
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['batch_size'],
+        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['batch_size'],
+        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True,
     )
 
     input_dim = len(processor.input_cols)
     output_dim = len(processor.target_cols)
 
-    # 使用完整的Transformer模型
-    model = TimeSeriesTransformer(input_dim, output_dim, config['seq_len'])
+    # 初始化模型
+    model = PrinterPINN(input_dim, output_dim, config.seq_len)
 
     if torch.cuda.device_count() > 1:
         print(f"🎮 使用 {torch.cuda.device_count()} 个 GPU!")
         model = nn.DataParallel(model)
 
-    model = model.to(config['device'])
+    model = model.to(config.device)
 
-    base_lr = config['lr']
-    scaled_lr = base_lr
-
+    # 初始化优化器和scheduler
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=scaled_lr,
+        lr=config.lr,
         betas=(0.9, 0.999),
         weight_decay=1e-5
     )
-
-    warmup_epochs = 3  # 减少warmup轮数
-    total_epochs = config['epochs']
 
     warmup_scheduler = LinearLR(
         optimizer,
         start_factor=0.1,
         end_factor=1.0,
-        total_iters=warmup_epochs
+        total_iters=config.warmup_epochs
     )
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=total_epochs - warmup_epochs,
+        T_max=config.epochs - config.warmup_epochs,
         eta_min=1e-6
     )
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_epochs]
+        milestones=[config.warmup_epochs]
     )
 
     criterion = nn.MSELoss()
     scaler = GradScaler('cuda') 
 
     # TensorBoard设置
-    log_dir = os.path.join("runs", "transformer_experiment_fast")
+    log_dir = os.path.join("runs", "pinn_experiment")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"📊 TensorBoard 日志目录: {log_dir}")
 
+    # 加载检查点（如果存在）
+    start_epoch = 0
+    train_loss = 0
+    val_loss = 0
     best_val_loss = float('inf')
-    global_step = 0
-    print_every = 50  # 减少打印频率
+    
+    if config.resume_from:
+        checkpoint_path = os.path.join(config.checkpoint_dir, config.resume_from)
+        start_epoch, train_loss, val_loss, best_val_loss = load_checkpoint(
+            checkpoint_path, model, optimizer, scheduler, config
+        )
+        print(f"🔄 从检查点继续训练: {checkpoint_path}")
+        print(f"   开始轮数: {start_epoch}, 最佳验证损失: {best_val_loss:.6f}")
+
+    global_step = start_epoch * len(train_loader)
+    print_every = 100
     training_start_time = time.time()
     epoch_times = []
     
     print("\n🚀 开始训练...\n")
     
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
         model.train()
         epoch_loss = 0
@@ -398,23 +440,31 @@ def train_model():
 
         # ==================== 训练循环 ====================
         for batch_idx, (batch_X, batch_Y) in enumerate(train_loader):
-            batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
+            batch_X, batch_Y = batch_X.to(config.device), batch_Y.to(config.device)
 
             with autocast('cuda'):
                 outputs = model(batch_X)
-                loss = criterion(outputs, batch_Y) / config['gradient_accumulation_steps']
-            
-            scaler.scale(loss).backward()
+                
+                # 数据拟合损失
+                data_loss = criterion(outputs, batch_Y)
+                
+                # 物理约束损失
+                physics_loss = model.physics_loss(outputs, batch_Y)
+                
+                # 总损失
+                total_loss = data_loss + config.lambda_physics * physics_loss
+
+            scaler.scale(total_loss).backward()
             
             # 梯度累积
-            if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            epoch_loss += loss.item() * config['gradient_accumulation_steps']
+            epoch_loss += total_loss.item() * config.gradient_accumulation_steps
 
             if (batch_idx + 1) % print_every == 0:
                 avg_so_far = epoch_loss / (batch_idx + 1)
@@ -424,7 +474,7 @@ def train_model():
                 batches_per_epoch = len(train_loader)
                 batches_done = batch_idx + 1
                 batches_remaining_in_epoch = batches_per_epoch - batches_done
-                epochs_remaining = total_epochs - epoch - 1
+                epochs_remaining = config.epochs - epoch - 1
                 
                 avg_batch_time = elapsed_batch_time / batches_done
                 epoch_time_remaining = avg_batch_time * batches_remaining_in_epoch
@@ -459,7 +509,7 @@ def train_model():
         
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
-                batch_X, batch_Y = batch_X.to(config['device']), batch_Y.to(config['device'])
+                batch_X, batch_Y = batch_X.to(config.device), batch_Y.to(config.device)
                 with autocast('cuda'):
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_Y)
@@ -479,24 +529,33 @@ def train_model():
         elapsed_total_time = time.time() - training_start_time
         epochs_completed = epoch + 1
         avg_epoch_time = sum(epoch_times) / len(epoch_times)
-        remaining_epochs = total_epochs - epochs_completed
+        remaining_epochs = config.epochs - epochs_completed
         estimated_remaining_time = avg_epoch_time * remaining_epochs
         
-        progress_percent = (epochs_completed / total_epochs) * 100
+        progress_percent = (epochs_completed / config.epochs) * 100
         
-        print(f"🟢 Epoch {epoch+1:3d}/{total_epochs} ({progress_percent:5.1f}%) | "
+        print(f"🟢 Epoch {epoch+1:3d}/{config.epochs} ({progress_percent:5.1f}%) | "
               f"Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | "
               f"Time: {epoch_time:.2f}s | 总用时: {format_time(elapsed_total_time)} | "
               f"ETA: {format_time(estimated_remaining_time)}")
 
+        # 保存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), 'best_transformer_model_fast.pth')
-            print(f"  💾 模型已保存 (最佳验证损失: {best_val_loss:.6f})")
+            checkpoint_filename = f"best_pinn_model_epoch{epoch+1}.pth"
+            save_checkpoint(epoch+1, model, optimizer, scheduler, avg_train_loss, avg_val_loss, best_val_loss, config, 
+                          os.path.join(config.checkpoint_dir, checkpoint_filename))
+            print(f"  💾 最佳模型已保存 (验证损失: {best_val_loss:.6f})")
+
+        # 定期保存检查点
+        if (epoch + 1) % 5 == 0:
+            checkpoint_filename = f"checkpoint_epoch{epoch+1}.pth"
+            save_checkpoint(epoch+1, model, optimizer, scheduler, avg_train_loss, avg_val_loss, best_val_loss, config,
+                          os.path.join(config.checkpoint_dir, checkpoint_filename))
 
     total_training_time = time.time() - training_start_time
     print(f"\n{'='*70}")
-    print(f"🎉 快速训练完成！")
+    print(f"🎉 PINN训练完成！")
     print(f"{'='*70}")
     print(f"⏱️  总用时: {format_time(total_training_time)}")
     print(f"📊 最佳验证损失: {best_val_loss:.6f}")
@@ -505,9 +564,87 @@ def train_model():
     writer.close()
 
     print("📊 生成预测可视化图表...")
+    # 可视化函数保持不变
     visualize_predictions(model, val_loader, processor)
 
+def visualize_predictions(model, loader, processor):
+    """可视化预测结果"""
+    import matplotlib.pyplot as plt
+
+    model.eval()
+    with torch.no_grad():
+        for batch_X, batch_Y in loader:
+            batch_X, batch_Y = batch_X.to(config.device), batch_Y.to(config.device)
+            preds = model(batch_X)
+            break
+
+    preds_np = preds.cpu().numpy()
+    targets_np = batch_Y.cpu().numpy()
+
+    preds_real = processor.inverse_transform_y(preds_np)
+    targets_real = processor.inverse_transform_y(targets_np)
+
+    plt.figure(figsize=(12, 8))
+    for i in range(6):
+        plt.subplot(3, 2, i + 1)
+        plt.plot(targets_real[:100, i], label='Ground Truth', alpha=0.7)
+        plt.plot(preds_real[:100, i], label='Prediction', linestyle='--')
+        plt.title(f'Feature: {processor.target_cols[i]}')
+        plt.legend()
+        plt.grid(True)
+    plt.tight_layout()
+
+    os.makedirs('image', exist_ok=True)
+    image_path = os.path.join('image', 'prediction_visualization.png')
+    plt.savefig(image_path)
+    print(f"📊 可视化图片已保存至: {image_path}")
+    plt.show()
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train PrinterPINN model')
+    parser.add_argument('--resume', type=str, default=None, 
+                       help='Path to checkpoint to resume from')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=3e-4,
+                       help='Learning rate')
+    parser.add_argument('--lambda_physics', type=float, default=0.1,
+                       help='Physics constraint weight')
+    parser.add_argument('--model_dim', type=int, default=256,
+                       help='Model dimension')
+    parser.add_argument('--num_layers', type=int, default=6,
+                       help='Number of transformer layers')
+    parser.add_argument('--batch_size', type=int, default=2048,
+                       help='Batch size')
+    parser.add_argument('--max_samples', type=int, default=500000,
+                       help='Maximum number of samples')
+    return parser.parse_args()
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    train_model()
+    import random
+    
+    # 设置随机种子
+    RANDOM_SEED = 42
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    
+    # 解析命令行参数
+    args = parse_args()
+    
+    # 创建配置对象
+    config = Config()
+    
+    # 更新配置参数
+    config.epochs = args.epochs
+    config.lr = args.lr
+    config.lambda_physics = args.lambda_physics
+    config.model_dim = args.model_dim
+    config.num_layers = args.num_layers
+    config.batch_size = args.batch_size
+    config.max_samples = args.max_samples
+    config.resume_from = args.resume
+    
+    # 开始训练
+    train_pinn_model(config)
