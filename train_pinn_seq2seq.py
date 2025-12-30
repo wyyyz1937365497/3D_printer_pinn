@@ -1,4 +1,4 @@
-# train_pinn_seq2seq.py (完整改进版)
+# train_pinn_transformer_multitask.py
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -11,48 +11,58 @@ import argparse
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import pickle
 import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 import signal
 import atexit
+import warnings
+warnings.filterwarnings('ignore')
 
 # ==================== 配置参数 ====================
 class Config:
     def __init__(self):
-        self.data_path = 'enterprise_dataset/printer_enterprise_data.csv'
-        self.seq_len = 200          # 历史长度
-        self.pred_len = 50          # 预测长度
-        self.batch_size = 256
+        self.data_path = 'printer_dataset/nozzle_simulation_gear_print.csv'
+        self.seq_len = 200          # 历史窗口长度（200ms @ 1ms步长）
+        self.pred_len = 50          # 预测长度（50ms）
+        self.batch_size = 128
         self.gradient_accumulation_steps = 4
         self.model_dim = 256
         self.num_heads = 8
         self.num_layers = 6
         self.dim_feedforward = 1024
         self.dropout = 0.1
-        self.lr = 2e-4
-        self.epochs = 30
+        self.lr = 1e-4
+        self.epochs = 50
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.num_workers = 4
-        self.max_samples = 200000
-        self.lambda_physics = 0.05
+        self.max_samples = 100000
+        self.lambda_physics = 0.1   # 物理损失权重
+        self.lambda_classification = 1.0  # 分类损失权重
+        self.lambda_rul = 0.5       # RUL损失权重
         self.warmup_epochs = 5
-        self.checkpoint_dir = './checkpoints_seq2seq'
+        self.checkpoint_dir = './checkpoints_multitask'
         self.resume_from = None
         self.save_on_exit = True
         self.save_interval = 5
         self.start_epoch = 0
-        self.load_optimizer_state = True  # 优化器状态加载控制
-        self.original_batch_size = None   # 原始batch size（用于学习率缩放）
+        self.load_optimizer_state = True
         
         # 列定义
-        self.ctrl_cols = ['ctrl_T_target', 'ctrl_speed_set', 'ctrl_heater_base']
-        self.state_cols = ['temperature_C', 'vibration_disp_m', 'vibration_vel_m_s',
-                          'motor_current_A', 'pressure_bar', 'acoustic_signal']
+        self.ctrl_cols = ['ctrl_T_target', 'ctrl_speed_set', 'ctrl_pos_x', 'ctrl_pos_y', 'ctrl_pos_z']
+        self.state_cols = ['temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m', 
+                          'vibration_vel_x_m_s', 'vibration_vel_y_m_s', 
+                          'motor_current_x_A', 'motor_current_y_A', 'motor_current_z_A',
+                          'pressure_bar', 'nozzle_pos_x_mm', 'nozzle_pos_y_mm', 'nozzle_pos_z_mm',
+                          'print_quality']
+        self.target_cols = ['fault_label', 'fault_type', 'print_quality']
         
         # 维度定义
         self.input_dim = len(self.ctrl_cols) + len(self.state_cols)
         self.output_dim = len(self.state_cols)
         self.ctrl_dim = len(self.ctrl_cols)
+        self.class_dim = 4  # 3种故障类型 + 正常
+        self.rul_dim = 1    # RUL预测
 
 # ==================== 位置编码 ====================
 class PositionalEncoding(nn.Module):
@@ -65,22 +75,23 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
-
+    
     def forward(self, x):
         return x + self.pe[:, :x.size(1), :]
 
-# ==================== Seq2Seq 模型 ====================
-class PrinterPINN_Seq2Seq(nn.Module):
+# ==================== 多任务PINN-Transformer模型 ====================
+class PrinterPINN_MultiTask(nn.Module):
     def __init__(self, config):
-        super(PrinterPINN_Seq2Seq, self).__init__()
-        
+        super(PrinterPINN_MultiTask, self).__init__()
         self.input_dim = config.input_dim
         self.output_dim = config.output_dim
         self.ctrl_dim = config.ctrl_dim
         self.d_model = config.model_dim
         self.pred_len = config.pred_len
+        self.class_dim = config.class_dim
+        self.rul_dim = config.rul_dim
         
-        # Encoder
+        # 共享编码器
         self.encoder_embedding = nn.Linear(self.input_dim, self.d_model)
         self.pos_encoder = PositionalEncoding(self.d_model)
         
@@ -89,61 +100,129 @@ class PrinterPINN_Seq2Seq(nn.Module):
             nhead=config.num_heads,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         
-        # Decoder
+        # 解码器（用于物理场重构）
         self.decoder_embedding = nn.Linear(self.ctrl_dim, self.d_model)
-        
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.d_model,
             nhead=config.num_heads,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_layers)
-        
-        # Output
         self.fc_out = nn.Linear(self.d_model, self.output_dim)
-
+        
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(self.d_model, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, self.class_dim)
+        )
+        
+        # RUL回归头
+        self.rul_predictor = nn.Sequential(
+            nn.Linear(self.d_model, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, self.rul_dim),
+            nn.ReLU()  # RUL应为正数
+        )
+        
     def forward(self, src, tgt_ctrl):
-        # Encoder
+        # 共享编码器
         src_emb = self.encoder_embedding(src)
         src_emb = self.pos_encoder(src_emb)
-        memory = self.encoder(src_emb)
+        memory = self.encoder(src_emb)  # [batch, seq_len, d_model]
         
-        # Decoder
+        # 物理场重构解码器
         tgt_emb = self.decoder_embedding(tgt_ctrl)
         tgt_emb = self.pos_encoder(tgt_emb)
-        output = self.decoder(tgt_emb, memory)
+        decoder_output = self.decoder(tgt_emb, memory)
+        physics_pred = self.fc_out(decoder_output)  # [batch, pred_len, output_dim]
         
-        prediction = self.fc_out(output)
-        return prediction
-
-    def physics_loss(self, y_pred, y_true):
-        """物理约束损失（针对序列）"""
+        # 使用编码器的最终状态进行分类和RUL预测
+        # 取序列的最后一个时间步
+        last_hidden = memory[:, -1, :]  # [batch, d_model]
+        
+        # 故障分类
+        class_pred = self.classifier(last_hidden)  # [batch, class_dim]
+        
+        # RUL预测
+        rul_pred = self.rul_predictor(last_hidden)  # [batch, 1]
+        
+        return {
+            'physics_pred': physics_pred,
+            'class_pred': class_pred,
+            'rul_pred': rul_pred,
+            'memory': memory
+        }
+    
+    def physics_loss(self, outputs, targets, device='cuda'):
+        """物理约束损失（针对3D打印喷头动力学）"""
+        physics_pred = outputs['physics_pred']
+        y_true = targets
+        
         loss = 0.0
-        batch_size, seq_len, _ = y_pred.shape
+        batch_size, seq_len, _ = physics_pred.shape
         
-        # 热传导损失：温度变化平滑
-        temp_pred = y_pred[:, :, 0]
-        dT_pred = torch.diff(temp_pred, dim=1)
-        d2T_pred = torch.diff(dT_pred, dim=1)
-        loss += torch.mean(d2T_pred ** 2)
+        # 1. 热传导方程约束（温度变化应平滑）
+        temp_pred = physics_pred[:, :, 0]  # temperature_C
+        dT_dt = torch.diff(temp_pred, dim=1) / 0.001  # 1ms步长
+        d2T_dt2 = torch.diff(dT_dt, dim=1) / 0.001
         
-        # 振动能量守恒
-        disp_pred = y_pred[:, :, 1]
-        vel_pred = y_pred[:, :, 2]
-        dt = 1.0
-        vel_from_disp = torch.diff(disp_pred, dim=1) / dt
-        loss += torch.mean((vel_from_disp - vel_pred[:, :-1]) ** 2)
+        # 温度加速度应有限（避免不合理的剧烈变化）
+        thermal_loss = torch.mean(torch.abs(d2T_dt2))
+        loss += thermal_loss
+        
+        # 2. 振动动力学约束（质量-弹簧-阻尼系统）
+        disp_x_pred = physics_pred[:, :, 1]  # vibration_disp_x_m
+        disp_y_pred = physics_pred[:, :, 2]  # vibration_disp_y_m
+        vel_x_pred = physics_pred[:, :, 3]   # vibration_vel_x_m_s
+        vel_y_pred = physics_pred[:, :, 4]   # vibration_vel_y_m_s
+        
+        # 从位移计算速度（应与预测的速度一致）
+        dt = 0.001  # 1ms
+        vel_x_from_disp = torch.diff(disp_x_pred, dim=1) / dt
+        vel_y_from_disp = torch.diff(disp_y_pred, dim=1) / dt
+        
+        # 速度一致性损失
+        vibration_loss = torch.mean((vel_x_from_disp - vel_x_pred[:, :-1])**2) + \
+                        torch.mean((vel_y_from_disp - vel_y_pred[:, :-1])**2)
+        loss += vibration_loss
+        
+        # 3. 能量守恒约束（简化的）
+        kinetic_energy = vel_x_pred**2 + vel_y_pred**2
+        d_energy_dt = torch.diff(kinetic_energy, dim=1) / dt
+        energy_loss = torch.mean(torch.abs(d_energy_dt))
+        loss += 0.1 * energy_loss
+        
+        # 4. 电机电流-振动耦合约束
+        current_x_pred = physics_pred[:, :, 5]  # motor_current_x_A
+        current_y_pred = physics_pred[:, :, 6]  # motor_current_y_A
+        
+        # 电流应与加速度相关（F=ma，而F与电流成正比）
+        accel_x_pred = torch.diff(vel_x_pred, dim=1) / dt
+        accel_y_pred = torch.diff(vel_y_pred, dim=1) / dt
+        
+        current_accel_corr_x = torch.mean(current_x_pred[:, :-1] * accel_x_pred)
+        current_accel_corr_y = torch.mean(current_y_pred[:, :-1] * accel_y_pred)
+        
+        # 确保相关性合理（避免完全不相关的预测）
+        coupling_loss = torch.abs(1.0 - torch.abs(current_accel_corr_x)) + \
+                       torch.abs(1.0 - torch.abs(current_accel_corr_y))
+        loss += 0.2 * coupling_loss
         
         return loss
 
 # ==================== 数据处理器 ====================
-class MemoryDataProcessor:
+class MultiTaskDataProcessor:
     def __init__(self, data_path, seq_len, pred_len, max_samples, config):
         self.data_path = data_path
         self.seq_len = seq_len
@@ -151,25 +230,27 @@ class MemoryDataProcessor:
         self.max_samples = max_samples
         self.config = config
         
-        self.input_dim = len(self.config.ctrl_cols) + len(self.config.state_cols)
-        self.output_dim = len(self.config.state_cols)
-        self.ctrl_dim = len(self.config.ctrl_cols)
-        
-        print(f"🔄 开始处理数据...")
+        print(f"🔄 开始处理多任务数据...")
         print(f"📊 历史长度: {seq_len}, 预测长度: {pred_len}")
         self.process_data()
-
+    
     def process_data(self):
-        """处理数据用于Seq2Seq训练"""
+        """处理数据用于多任务训练"""
         df = pd.read_csv(self.data_path)
         print(f"✅ 原始数据加载: {df.shape}")
         
-        numeric_cols = self.config.ctrl_cols + self.config.state_cols + ['fault_label']
+        # 转换为数值类型
+        numeric_cols = self.config.ctrl_cols + self.config.state_cols + ['fault_label', 'fault_type', 'timestamp']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = df[col].astype(np.float32)
         
-        all_cols = self.config.ctrl_cols + self.config.state_cols
+        # 特征工程：添加时间特征
+        df['hour'] = (df['timestamp'] % 3600) / 3600  # 小时周期
+        
+        # 选择相关列
+        all_cols = self.config.ctrl_cols + self.config.state_cols + ['hour']
+        target_cols = ['fault_label', 'fault_type', 'print_quality']
         
         grouped = df.groupby('machine_id')
         samples = []
@@ -178,10 +259,11 @@ class MemoryDataProcessor:
         print("📊 收集样本索引...")
         for machine_id, group in grouped:
             group = group.sort_values('timestamp').reset_index(drop=True)
+            
+            # 数据数组
             data_array = group[all_cols].values
             ctrl_array = group[self.config.ctrl_cols].values
-            state_array = group[self.config.state_cols].values
-            fault_array = group['fault_label'].values if 'fault_label' in group.columns else np.zeros(len(group))
+            target_array = group[target_cols].values
             
             total_len = len(group)
             required_len = self.seq_len + self.pred_len
@@ -195,258 +277,222 @@ class MemoryDataProcessor:
                 if count >= self.max_samples:
                     break
                 
-                window_fault = fault_array[i:i+required_len]
-                if np.any(window_fault == 1):
-                    continue
+                # 检查窗口内是否有故障
+                window_fault = target_array[i:i+required_len, 0]  # fault_label
                 
+                # 如果窗口内有故障，只在故障发生后的窗口使用
+                if np.any(window_fault == 1):
+                    fault_indices = np.where(window_fault == 1)[0]
+                    first_fault_idx = fault_indices[0]
+                    if first_fault_idx < self.seq_len:  # 故障在历史窗口内
+                        continue
+                
+                # 提取样本
                 x_hist = data_array[i:i+self.seq_len]
                 x_future_ctrl = ctrl_array[i+self.seq_len:i+required_len]
-                y_future_state = state_array[i+self.seq_len:i+required_len]
+                y_future_state = data_array[i+self.seq_len:i+required_len, len(self.config.ctrl_cols):len(self.config.ctrl_cols)+len(self.config.state_cols)]
+                y_targets = target_array[i+self.seq_len:i+required_len]
                 
-                samples.append((x_hist, x_future_ctrl, y_future_state))
+                # 计算RUL（剩余使用寿命）
+                # 简化：如果当前无故障，RUL为到故障发生的时间；如果有故障，RUL为0
+                current_fault = target_array[i+self.seq_len, 0]  # 预测起点的故障状态
+                if current_fault == 0:
+                    future_faults = target_array[i+self.seq_len:, 0]
+                    fault_indices = np.where(future_faults == 1)[0]
+                    if len(fault_indices) > 0:
+                        first_fault_idx = fault_indices[0]
+                        rul = first_fault_idx * 0.001  # 转换为秒
+                    else:
+                        rul = 3600  # 默认1小时
+                else:
+                    rul = 0
+                
+                # RUL归一化（简化）
+                rul_normalized = min(rul, 3600) / 3600
+                
+                samples.append({
+                    'x_hist': x_hist,
+                    'x_future_ctrl': x_future_ctrl,
+                    'y_future_state': y_future_state,
+                    'y_fault_label': y_targets[0, 0],  # 当前步的故障标签
+                    'y_fault_type': y_targets[0, 1],   # 当前步的故障类型
+                    'y_rul': rul_normalized
+                })
+                
                 count += 1
+                if count % 10000 == 0:
+                    print(f"  已收集 {count} 个样本...")
+                
+                if count >= self.max_samples:
+                    break
             
             if count >= self.max_samples:
                 break
         
         self.total_samples = len(samples)
         self.split_idx = int(self.total_samples * 0.8)
-        
         train_samples = samples[:self.split_idx]
         val_samples = samples[self.split_idx:]
         
         print(f"📊 总样本数: {self.total_samples}")
         print(f"   训练集: {len(train_samples)}, 验证集: {len(val_samples)}")
         
+        # 计算统计量（仅使用训练集）
         print("📊 计算统计量...")
-        all_x_hist = np.array([s[0] for s in train_samples])
-        all_y_future = np.array([s[2] for s in train_samples])
+        all_x_hist = np.array([s['x_hist'] for s in train_samples])
         
         self.mean_X = all_x_hist.mean(axis=(0, 1))
         self.std_X = all_x_hist.std(axis=(0, 1))
-        self.mean_Y = all_y_future.mean(axis=(0, 1))
-        self.std_Y = all_y_future.std(axis=(0, 1))
-        
         self.std_X[self.std_X < 1e-8] = 1.0
-        self.std_Y[self.std_Y < 1e-8] = 1.0
         
         print(f"   Input Mean: {self.mean_X}")
         print(f"   Input Std: {self.std_X}")
-        print(f"   Output Mean: {self.mean_Y}")
-        print(f"   Output Std: {self.std_Y}")
         
-        self.train_X = np.zeros((len(train_samples), self.seq_len, self.input_dim), dtype=np.float32)
-        self.train_ctrl = np.zeros((len(train_samples), self.pred_len, self.ctrl_dim), dtype=np.float32)
-        self.train_Y = np.zeros((len(train_samples), self.pred_len, self.output_dim), dtype=np.float32)
+        # 准备训练和验证数据
+        self.prepare_datasets(train_samples, val_samples)
         
-        for idx, (x_hist, x_ctrl, y_state) in enumerate(train_samples):
-            self.train_X[idx] = (x_hist - self.mean_X) / self.std_X
-            self.train_ctrl[idx] = (x_ctrl - self.mean_X[:self.ctrl_dim]) / self.std_X[:self.ctrl_dim]
-            self.train_Y[idx] = (y_state - self.mean_Y) / self.std_Y
-        
-        self.val_X = np.zeros((len(val_samples), self.seq_len, self.input_dim), dtype=np.float32)
-        self.val_ctrl = np.zeros((len(val_samples), self.pred_len, self.ctrl_dim), dtype=np.float32)
-        self.val_Y = np.zeros((len(val_samples), self.pred_len, self.output_dim), dtype=np.float32)
-        
-        for idx, (x_hist, x_ctrl, y_state) in enumerate(val_samples):
-            self.val_X[idx] = (x_hist - self.mean_X) / self.std_X
-            self.val_ctrl[idx] = (x_ctrl - self.mean_X[:self.ctrl_dim]) / self.std_X[:self.ctrl_dim]
-            self.val_Y[idx] = (y_state - self.mean_Y) / self.std_Y
+        # 保存归一化参数
+        self.save_normalization_params()
         
         print(f"✅ 数据处理完成！")
-
-    def inverse_transform_y(self, y_norm):
-        return y_norm * self.std_Y + self.mean_Y
+    
+    def prepare_datasets(self, train_samples, val_samples):
+        """准备训练和验证数据集"""
+        def prepare_batch(samples):
+            X_hist = np.zeros((len(samples), self.seq_len, self.config.input_dim), dtype=np.float32)
+            X_ctrl = np.zeros((len(samples), self.pred_len, self.config.ctrl_dim), dtype=np.float32)
+            Y_state = np.zeros((len(samples), self.pred_len, len(self.config.state_cols)), dtype=np.float32)
+            Y_fault = np.zeros(len(samples), dtype=np.int64)
+            Y_fault_type = np.zeros(len(samples), dtype=np.int64)
+            Y_rul = np.zeros(len(samples), dtype=np.float32)
+            
+            for idx, sample in enumerate(samples):
+                X_hist[idx] = (sample['x_hist'] - self.mean_X) / self.std_X
+                X_ctrl[idx] = (sample['x_future_ctrl'] - self.mean_X[:self.config.ctrl_dim]) / self.std_X[:self.config.ctrl_dim]
+                # Y_state 也需要归一化，使用相同的方法
+                Y_state[idx] = (sample['y_future_state'] - self.mean_X[len(self.config.ctrl_cols):len(self.config.ctrl_cols)+len(self.config.state_cols)]) / \
+                              self.std_X[len(self.config.ctrl_cols):len(self.config.ctrl_cols)+len(self.config.state_cols)]
+                Y_fault[idx] = int(sample['y_fault_label'])
+                Y_fault_type[idx] = int(sample['y_fault_type'])
+                Y_rul[idx] = sample['y_rul']
+            
+            return X_hist, X_ctrl, Y_state, Y_fault, Y_fault_type, Y_rul
+        
+        self.train_X, self.train_ctrl, self.train_Y_state, self.train_Y_fault, self.train_Y_fault_type, self.train_Y_rul = prepare_batch(train_samples)
+        self.val_X, self.val_ctrl, self.val_Y_state, self.val_Y_fault, self.val_Y_fault_type, self.val_Y_rul = prepare_batch(val_samples)
+    
+    def save_normalization_params(self):
+        """保存归一化参数"""
+        params = {
+            'mean_X': self.mean_X,
+            'std_X': self.std_X,
+            'ctrl_cols': self.config.ctrl_cols,
+            'state_cols': self.config.state_cols
+        }
+        
+        params_path = os.path.join(self.config.checkpoint_dir, 'normalization_params.pkl')
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
+        with open(params_path, 'wb') as f:
+            pickle.dump(params, f)
+        
+        print(f"💾 归一化参数已保存: {params_path}")
 
 # ==================== 数据集类 ====================
-class Seq2SeqDataset(Dataset):
-    def __init__(self, X_hist, X_ctrl, Y):
+class MultiTaskDataset(Dataset):
+    def __init__(self, X_hist, X_ctrl, Y_state, Y_fault, Y_fault_type, Y_rul):
         self.X_hist = torch.from_numpy(X_hist)
         self.X_ctrl = torch.from_numpy(X_ctrl)
-        self.Y = torch.from_numpy(Y)
-
+        self.Y_state = torch.from_numpy(Y_state)
+        self.Y_fault = torch.from_numpy(Y_fault)
+        self.Y_fault_type = torch.from_numpy(Y_fault_type)
+        self.Y_rul = torch.from_numpy(Y_rul)
+    
     def __len__(self):
         return self.X_hist.shape[0]
-
+    
     def __getitem__(self, idx):
-        return self.X_hist[idx], self.X_ctrl[idx], self.Y[idx]
-
-def seq2seq_collate_fn(batch):
-    x_hist, x_ctrl, y = zip(*batch)
-    import torch
-    # 确保所有数据都是tensor类型
-    x_hist = torch.stack([torch.from_numpy(x) if isinstance(x, np.ndarray) else x for x in x_hist])
-    x_ctrl = torch.stack([torch.from_numpy(x) if isinstance(x, np.ndarray) else x for x in x_ctrl])
-    y = torch.stack([torch.from_numpy(y) if isinstance(y, np.ndarray) else y for y in y])
-    return x_hist, x_ctrl, y
-
-# ==================== 训练状态管理器 ====================
-class TrainingStateManager:
-    """管理训练状态，用于优雅退出和恢复"""
-    def __init__(self, config, model, optimizer, scheduler, checkpoint_dir):
-        self.config = config
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.checkpoint_dir = checkpoint_dir
-        self.current_epoch = 0
-        self.train_loss = 0.0
-        self.val_loss = 0.0
-        self.best_val_loss = float('inf')
-        self.training_start_time = time.time()
-        self.last_epoch_time = time.time()
-        
-    def update_epoch(self, epoch, train_loss, val_loss):
-        self.current_epoch = epoch
-        self.train_loss = train_loss
-        self.val_loss = val_loss
-        
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            
-        self.last_epoch_time = time.time()
-    
-    def save_checkpoint(self, filename):
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'train_loss': self.train_loss,
-            'val_loss': self.val_loss,
-            'best_val_loss': self.best_val_loss,
-            'config': self.config.__dict__,
-            'training_start_time': self.training_start_time
-        }
-        torch.save(checkpoint, filename)
-        print(f"💾 检查点已保存: {filename}")
-    
-    def get_time_info(self):
-        """获取时间信息字典"""
-        elapsed_total = time.time() - self.training_start_time
-        epochs_completed = self.current_epoch - self.config.start_epoch
-        remaining_epochs = self.config.epochs - self.current_epoch
-        
-        if epochs_completed > 0:
-            avg_epoch_time = elapsed_total / epochs_completed
-            eta_seconds = avg_epoch_time * remaining_epochs
-        else:
-            avg_epoch_time = 0
-            eta_seconds = 0
-            
         return {
-            'elapsed_total': elapsed_total,
-            'elapsed_formatted': format_time(elapsed_total),
-            'avg_epoch_time': avg_epoch_time,
-            'eta_seconds': eta_seconds,
-            'eta_formatted': format_time(eta_seconds),
-            'progress_percent': (self.current_epoch / self.config.epochs) * 100
+            'x_hist': self.X_hist[idx],
+            'x_ctrl': self.X_ctrl[idx],
+            'y_state': self.Y_state[idx],
+            'y_fault': self.Y_fault[idx],
+            'y_fault_type': self.Y_fault_type[idx],
+            'y_rul': self.Y_rul[idx]
         }
 
-# ==================== 工具函数 ====================
-def format_time(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-def load_checkpoint(model, optimizer, scheduler, filename, load_optimizer_state=True, verbose=True):
-    """加载检查点"""
-    checkpoint = torch.load(filename, map_location='cpu')
-    model.load_state_dict(checkpoint['model_state_dict'])
+def multitask_collate_fn(batch):
+    """自定义的collate函数"""
+    x_hist = torch.stack([item['x_hist'] for item in batch])
+    x_ctrl = torch.stack([item['x_ctrl'] for item in batch])
+    y_state = torch.stack([item['y_state'] for item in batch])
+    y_fault = torch.stack([item['y_fault'] for item in batch])
+    y_fault_type = torch.stack([item['y_fault_type'] for item in batch])
+    y_rul = torch.stack([item['y_rul'] for item in batch])
     
-    if load_optimizer_state and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if load_optimizer_state and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-    start_epoch = checkpoint.get('epoch', 0)
-    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-    train_loss = checkpoint.get('train_loss', 0)
-    val_loss = checkpoint.get('val_loss', 0)
-    
-    # 获取原始batch size（用于学习率调整）
-    original_config = checkpoint.get('config', {})
-    original_batch_size = original_config.get('batch_size', None)
-    
-    if verbose:
-        print(f"✅ 检查点已加载: {filename}")
-        print(f"   从Epoch {start_epoch}开始继续训练")
-        print(f"   当前验证损失: {val_loss:.6f}")
-        print(f"   最佳验证损失: {best_val_loss:.6f}")
-        if original_batch_size:
-            print(f"   原始Batch Size: {original_batch_size}")
-    
-    return start_epoch, train_loss, val_loss, best_val_loss, original_batch_size
-
-def save_checkpoint(epoch, model, optimizer, scheduler, train_loss, val_loss, best_val_loss, config, filename):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'train_loss': train_loss,
-        'val_loss': val_loss,
-        'best_val_loss': best_val_loss,
-        'config': config.__dict__
+    return {
+        'x_hist': x_hist,
+        'x_ctrl': x_ctrl,
+        'y_state': y_state,
+        'y_fault': y_fault,
+        'y_fault_type': y_fault_type,
+        'y_rul': y_rul
     }
-    torch.save(checkpoint, filename)
-    print(f"💾 检查点已保存: {filename}")
 
 # ==================== 训练函数 ====================
-def train_pinn_seq2seq(config):
-    print("=" * 70)
-    print("🚀 PrinterPINN Seq2Seq 训练")
-    print("=" * 70)
+def train_multitask_pinn(config):
+    print("=" * 80)
+    print("🚀 PrinterPINN 多任务训练 (物理场重构 + 故障分类 + RUL预测)")
+    print("=" * 80)
     
-    # 打印配置信息
-    print(f"\n📋 训练配置:")
-    print(f"   Batch Size: {config.batch_size}")
-    print(f"   Gradient Accumulation: {config.gradient_accumulation_steps}")
-    print(f"   Effective Batch Size: {config.batch_size * config.gradient_accumulation_steps}")
-    print(f"   Learning Rate: {config.lr}")
-    print(f"   Epochs: {config.epochs}")
-    print(f"   Device: {config.device}")
-    print(f"   物理损失权重: {config.lambda_physics}")
-
+    # 创建检查点目录
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-
+    
     # 数据处理
-    processor = MemoryDataProcessor(
+    processor = MultiTaskDataProcessor(
         config.data_path,
         config.seq_len,
         config.pred_len,
         config.max_samples,
         config
     )
-
-    train_dataset = Seq2SeqDataset(processor.train_X, processor.train_ctrl, processor.train_Y)
-    val_dataset = Seq2SeqDataset(processor.val_X, processor.val_ctrl, processor.val_Y)
-
+    
+    # 创建数据集和数据加载器
+    train_dataset = MultiTaskDataset(
+        processor.train_X, processor.train_ctrl, processor.train_Y_state,
+        processor.train_Y_fault, processor.train_Y_fault_type, processor.train_Y_rul
+    )
+    
+    val_dataset = MultiTaskDataset(
+        processor.val_X, processor.val_ctrl, processor.val_Y_state,
+        processor.val_Y_fault, processor.val_Y_fault_type, processor.val_Y_rul
+    )
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True,
-        collate_fn=seq2seq_collate_fn
+        collate_fn=multitask_collate_fn
     )
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
         pin_memory=True,
-        collate_fn=seq2seq_collate_fn
+        collate_fn=multitask_collate_fn
     )
-
+    
     # 模型
-    model = PrinterPINN_Seq2Seq(config)
+    model = PrinterPINN_MultiTask(config)
     if torch.cuda.device_count() > 1:
         print(f"🎮 使用 {torch.cuda.device_count()} 个 GPU!")
         model = nn.DataParallel(model)
     model = model.to(config.device)
-
+    
     # 优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -454,159 +500,102 @@ def train_pinn_seq2seq(config):
         betas=(0.9, 0.999),
         weight_decay=1e-5
     )
-
+    
+    # 学习率调度器
     warmup_scheduler = LinearLR(
         optimizer,
         start_factor=0.1,
         end_factor=1.0,
-        total_iters=config.warmup_epochs
+        total_iters=config.warmup_epochs * len(train_loader)
     )
+    
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=config.epochs - config.warmup_epochs,
+        T_max=(config.epochs - config.warmup_epochs) * len(train_loader),
         eta_min=1e-6
     )
+    
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[config.warmup_epochs]
+        milestones=[config.warmup_epochs * len(train_loader)]
     )
-
-    criterion = nn.MSELoss()
+    
+    # 损失函数
+    physics_criterion = nn.MSELoss()
+    class_criterion = nn.CrossEntropyLoss()
+    rul_criterion = nn.MSELoss()
+    
+    # 混合精度训练
     scaler = GradScaler('cuda')
-
+    
     # TensorBoard
-    log_dir = os.path.join("runs", "seq2seq_experiment")
+    log_dir = os.path.join("runs", f"multitask_{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
-
-    # 从检查点恢复训练
+    
+    # 从检查点恢复
     start_epoch = 0
     best_val_loss = float('inf')
     
     if config.resume_from is not None and os.path.exists(config.resume_from):
-        start_epoch, _, _, best_val_loss, original_batch_size = load_checkpoint(
-            model, optimizer, scheduler, config.resume_from, 
-            config.load_optimizer_state, verbose=True
-        )
-        
-        # 处理batch size变化的情况
-        if original_batch_size and original_batch_size != config.batch_size:
-            batch_scale = config.batch_size / original_batch_size
-            print(f"\n⚠️  检测到Batch Size变化!")
-            print(f"   原始: {original_batch_size} -> 当前: {config.batch_size}")
-            print(f"   缩放因子: {batch_scale:.2f}x")
-            
-            # 根据batch size缩放调整学习率和优化器状态
-            if config.load_optimizer_state:
-                print(f"   🔧 检测到加载了优化器状态，但batch size已变化")
-                print(f"   建议设置 --load_optimizer_state=False 或 --lr {config.lr * batch_scale:.2e}")
-                print(f"   或手动调整学习率以匹配新的batch size")
-            else:
-                # 自动调整学习率
-                new_lr = config.lr * batch_scale
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                print(f"   ✅ 学习率已自动调整: {config.lr:.2e} -> {new_lr:.2e}")
-                config.lr = new_lr
-            
-            # 调整scheduler的milestone
-            warmup_scheduler.total_iters = max(1, int(config.warmup_epochs))
-            cosine_scheduler.T_max = max(1, config.epochs - config.warmup_epochs)
-        
-        config.start_epoch = start_epoch
-        config.original_batch_size = original_batch_size
-    else:
-        print("ℹ️  从头开始训练")
-
-    # 创建状态管理器
-    state_manager = TrainingStateManager(config, model, optimizer, scheduler, config.checkpoint_dir)
-    state_manager.current_epoch = start_epoch
-    state_manager.best_val_loss = best_val_loss
-
-    # 注册优雅退出处理器
-    def graceful_exit_handler(signum=None, frame=None):
-        print(f"\n{'='*70}")
-        print(f"⚠️  接收到退出信号，正在优雅关闭...")
-        print(f"{'='*70}")
-        
-        time_info = state_manager.get_time_info()
-        print(f"\n📊 训练进度:")
-        print(f"   当前Epoch: {state_manager.current_epoch}/{config.epochs}")
-        print(f"   训练损失: {state_manager.train_loss:.6f}")
-        print(f"   验证损失: {state_manager.val_loss:.6f}")
-        print(f"   最佳验证损失: {state_manager.best_val_loss:.6f}")
-        print(f"\n⏱️  时间统计:")
-        print(f"   已训练时间: {time_info['elapsed_formatted']}")
-        print(f"   平均每个Epoch: {format_time(time_info['avg_epoch_time'])}")
-        
-        if config.save_on_exit:
-            print(f"\n💾 正在保存检查点...")
-            final_checkpoint_path = os.path.join(
-                config.checkpoint_dir, 
-                f"interrupted_epoch{state_manager.current_epoch}.pth"
-            )
-            state_manager.save_checkpoint(final_checkpoint_path)
-            
-            # 保存训练摘要
-            summary_path = os.path.join(config.checkpoint_dir, "training_summary.txt")
-            with open(summary_path, 'w') as f:
-                f.write("训练中断摘要\n")
-                f.write("="*70 + "\n\n")
-                f.write(f"当前Epoch: {state_manager.current_epoch}/{config.epochs}\n")
-                f.write(f"训练损失: {state_manager.train_loss:.6f}\n")
-                f.write(f"验证损失: {state_manager.val_loss:.6f}\n")
-                f.write(f"最佳验证损失: {state_manager.best_val_loss:.6f}\n")
-                f.write(f"已训练时间: {time_info['elapsed_formatted']}\n")
-                f.write(f"配置:\n")
-                for key, value in config.__dict__.items():
-                    f.write(f"  {key}: {value}\n")
-            print(f"   摘要已保存: {summary_path}")
-        
-        print(f"\n{'='*70}")
-        print(f"✅ 优雅关闭完成")
-        print(f"{'='*70}\n")
-        
-        writer.close()
-        exit(0)
-
-    # 注册信号处理器
-    signal.signal(signal.SIGINT, graceful_exit_handler)
-    signal.signal(signal.SIGTERM, graceful_exit_handler)
+        start_epoch, best_val_loss = load_checkpoint(model, optimizer, scheduler, config.resume_from)
     
-    # 注册atexit处理器（正常退出时也会调用）
-    atexit.register(lambda: None)  # 防止重复注册
-
     # 训练循环
     print_every = 50
-    epoch_times = []
-    
-    print("\n🚀 开始训练...\n")
-    print(f"{'='*70}")
+    print("\n🚀 开始多任务训练...")
+    print(f"{'='*80}")
     
     for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
         model.train()
-        epoch_loss = 0
+        
+        total_physics_loss = 0
+        total_class_loss = 0
+        total_rul_loss = 0
+        total_physics_loss_term = 0
+        
         optimizer.zero_grad()
-
-        for batch_idx, (batch_x_hist, batch_x_ctrl, batch_y) in enumerate(train_loader):
-            batch_x_hist = batch_x_hist.to(config.device)
-            batch_x_ctrl = batch_x_ctrl.to(config.device)
-            batch_y = batch_y.to(config.device)
-
+        
+        for batch_idx, batch in enumerate(train_loader):
+            # 将数据移动到设备
+            x_hist = batch['x_hist'].to(config.device)
+            x_ctrl = batch['x_ctrl'].to(config.device)
+            y_state = batch['y_state'].to(config.device)
+            y_fault = batch['y_fault'].to(config.device)
+            y_fault_type = batch['y_fault_type'].to(config.device)
+            y_rul = batch['y_rul'].to(config.device)
+            
             with autocast('cuda'):
-                outputs = model(batch_x_hist, batch_x_ctrl)
+                # 前向传播
+                outputs = model(x_hist, x_ctrl)
                 
-                data_loss = criterion(outputs, batch_y)
+                # 1. 物理场重构损失
+                physics_loss = physics_criterion(outputs['physics_pred'], y_state)
                 
-                if isinstance(model, nn.DataParallel):
-                    physics_loss = model.module.physics_loss(outputs, batch_y)
-                else:
-                    physics_loss = model.physics_loss(outputs, batch_y)
+                # 2. 故障分类损失
+                # 将故障类型转换为分类标签（0=正常，1-3=故障类型）
+                class_labels = torch.zeros_like(y_fault, dtype=torch.long)
+                mask_fault = (y_fault == 1)
+                class_labels[mask_fault] = y_fault_type[mask_fault].long()
+                # 确保标签在[0, class_dim-1]范围内
+                class_labels = torch.clamp(class_labels, 0, config.class_dim-1)
                 
-                total_loss = data_loss + config.lambda_physics * physics_loss
-
+                class_loss = class_criterion(outputs['class_pred'], class_labels)
+                
+                # 3. RUL回归损失
+                rul_loss = rul_criterion(outputs['rul_pred'].squeeze(), y_rul)
+                
+                # 4. 物理约束损失
+                physics_constraint_loss = model.physics_loss(outputs, y_state, config.device)
+                
+                # 总损失
+                total_loss = (physics_loss + 
+                             config.lambda_classification * class_loss + 
+                             config.lambda_rul * rul_loss + 
+                             config.lambda_physics * physics_constraint_loss)
+            
+            # 反向传播
             scaler.scale(total_loss).backward()
             
             if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
@@ -615,108 +604,204 @@ def train_pinn_seq2seq(config):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-
-            epoch_loss += total_loss.item() * config.gradient_accumulation_steps
-
+                scheduler.step()
+            
+            # 累积损失
+            total_physics_loss += physics_loss.item()
+            total_class_loss += class_loss.item()
+            total_rul_loss += rul_loss.item()
+            total_physics_loss_term += physics_constraint_loss.item()
+            
+            # 打印进度
             if (batch_idx + 1) % print_every == 0:
-                avg_so_far = epoch_loss / (batch_idx + 1)
-                time_info = state_manager.get_time_info()
+                avg_physics = total_physics_loss / (batch_idx + 1)
+                avg_class = total_class_loss / (batch_idx + 1)
+                avg_rul = total_rul_loss / (batch_idx + 1)
+                avg_physics_term = total_physics_loss_term / (batch_idx + 1)
                 
-                print(f"  🔵 Epoch {epoch+1:3d}/{config.epochs} | "
-                      f"Batch {batch_idx+1:5d}/{len(train_loader):5d} | "
-                      f"Loss: {avg_so_far:.6f} | LR: {optimizer.param_groups[0]['lr']:.6e} | "
-                      f"ETA: {time_info['eta_formatted']}")
-
-        avg_train_loss = epoch_loss / len(train_loader)
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  🔵 Epoch {epoch+1:2d}/{config.epochs} | Batch {batch_idx+1:4d}/{len(train_loader):4d} | "
+                      f"Physics: {avg_physics:.4f} | Class: {avg_class:.4f} | RUL: {avg_rul:.4f} | "
+                      f"PhysicsTerm: {avg_physics_term:.4f} | LR: {current_lr:.2e}")
         
         # 验证
         model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch_x_hist, batch_x_ctrl, batch_y in val_loader:
-                batch_x_hist = batch_x_hist.to(config.device)
-                batch_x_ctrl = batch_x_ctrl.to(config.device)
-                batch_y = batch_y.to(config.device)
-                
-                with autocast('cuda'):
-                    outputs = model(batch_x_hist, batch_x_ctrl)
-                    loss = criterion(outputs, batch_y)
-                val_loss += loss.item()
-
-        avg_val_loss = val_loss / len(val_loader)
-        scheduler.step()
-
-        epoch_time = time.time() - epoch_start
-        epoch_times.append(epoch_time)
+        val_physics_loss = 0
+        val_class_loss = 0
+        val_rul_loss = 0
+        val_physics_term = 0
         
-        # 更新状态管理器
-        state_manager.update_epoch(epoch + 1, avg_train_loss, avg_val_loss)
-        time_info = state_manager.get_time_info()
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                x_hist = batch['x_hist'].to(config.device)
+                x_ctrl = batch['x_ctrl'].to(config.device)
+                y_state = batch['y_state'].to(config.device)
+                y_fault = batch['y_fault'].to(config.device)
+                y_fault_type = batch['y_fault_type'].to(config.device)
+                y_rul = batch['y_rul'].to(config.device)
+                
+                outputs = model(x_hist, x_ctrl)
+                
+                # 物理场重构损失
+                physics_loss = physics_criterion(outputs['physics_pred'], y_state)
+                
+                # 故障分类
+                class_labels = torch.zeros_like(y_fault, dtype=torch.long)
+                mask_fault = (y_fault == 1)
+                class_labels[mask_fault] = y_fault_type[mask_fault].long()
+                class_labels = torch.clamp(class_labels, 0, config.class_dim-1)
+                
+                class_loss = class_criterion(outputs['class_pred'], class_labels)
+                
+                # RUL损失
+                rul_loss = rul_criterion(outputs['rul_pred'].squeeze(), y_rul)
+                
+                # 物理约束
+                physics_term = model.physics_loss(outputs, y_state, config.device)
+                
+                val_physics_loss += physics_loss.item()
+                val_class_loss += class_loss.item()
+                val_rul_loss += rul_loss.item()
+                val_physics_term += physics_term.item()
+                
+                # 收集预测结果用于评估
+                _, predicted = torch.max(outputs['class_pred'], 1)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(class_labels.cpu().numpy())
+        
+        # 计算平均验证损失
+        avg_val_physics = val_physics_loss / len(val_loader)
+        avg_val_class = val_class_loss / len(val_loader)
+        avg_val_rul = val_rul_loss / len(val_loader)
+        avg_val_physics_term = val_physics_term / len(val_loader)
+        
+        total_val_loss = avg_val_physics + config.lambda_classification * avg_val_class + \
+                        config.lambda_rul * avg_val_rul + config.lambda_physics * avg_val_physics_term
+        
+        epoch_time = time.time() - epoch_start
         
         # 打印epoch摘要
-        print(f"🟢 Epoch {epoch+1:3d}/{config.epochs} ({time_info['progress_percent']:5.1f}%) | "
-              f"Train: {avg_train_loss:.6f} | Val: {avg_val_loss:.6f} | "
-              f"Time: {epoch_time:.2f}s | ETA: {time_info['eta_formatted']}")
-
-        writer.add_scalar("Loss/train", avg_train_loss, epoch)
-        writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        print(f"🟢 Epoch {epoch+1:2d}/{config.epochs} | Time: {epoch_time:.2f}s")
+        print(f"   Train - Physics: {total_physics_loss/len(train_loader):.4f} | "
+              f"Class: {total_class_loss/len(train_loader):.4f} | "
+              f"RUL: {total_rul_loss/len(train_loader):.4f} | "
+              f"PhysicsTerm: {total_physics_loss_term/len(train_loader):.4f}")
+        print(f"   Val   - Physics: {avg_val_physics:.4f} | "
+              f"Class: {avg_val_class:.4f} | "
+              f"RUL: {avg_val_rul:.4f} | "
+              f"PhysicsTerm: {avg_val_physics_term:.4f} | "
+              f"Total: {total_val_loss:.4f}")
+        
+        # 分类性能评估
+        if len(all_preds) > 0:
+            print("\n📊 分类报告:")
+            print(classification_report(all_labels, all_preds, 
+                                      target_names=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']))
+            
+            # 绘制混淆矩阵
+            plt.figure(figsize=(8, 6))
+            cm = confusion_matrix(all_labels, all_preds)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'],
+                       yticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'])
+            plt.title(f'Confusion Matrix - Epoch {epoch+1}')
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            
+            cm_path = os.path.join(config.checkpoint_dir, f'confusion_matrix_epoch{epoch+1}.png')
+            plt.savefig(cm_path)
+            plt.close()
+            
+            print(f"   混淆矩阵已保存: {cm_path}")
+        
+        # TensorBoard记录
+        writer.add_scalar("Loss/train_physics", total_physics_loss/len(train_loader), epoch)
+        writer.add_scalar("Loss/train_class", total_class_loss/len(train_loader), epoch)
+        writer.add_scalar("Loss/train_rul", total_rul_loss/len(train_loader), epoch)
+        writer.add_scalar("Loss/train_physics_term", total_physics_loss_term/len(train_loader), epoch)
+        
+        writer.add_scalar("Loss/val_physics", avg_val_physics, epoch)
+        writer.add_scalar("Loss/val_class", avg_val_class, epoch)
+        writer.add_scalar("Loss/val_rul", avg_val_rul, epoch)
+        writer.add_scalar("Loss/val_physics_term", avg_val_physics_term, epoch)
+        writer.add_scalar("Loss/val_total", total_val_loss, epoch)
+        
         writer.add_scalar("Time/epoch", epoch_time, epoch)
-
+        
         # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint_filename = "best_seq2seq_model.pth"
-            save_checkpoint(epoch+1, model, optimizer, scheduler, avg_train_loss, avg_val_loss, 
-                           best_val_loss, config, os.path.join(config.checkpoint_dir, checkpoint_filename))
-            print(f"  💾 最佳模型已保存 (验证损失: {best_val_loss:.6f})")
-
+        if total_val_loss < best_val_loss:
+            best_val_loss = total_val_loss
+            checkpoint_path = os.path.join(config.checkpoint_dir, "best_multitask_model.pth")
+            save_checkpoint(epoch+1, model, optimizer, scheduler, total_val_loss, best_val_loss, config, checkpoint_path)
+            print(f"  💾 最佳模型已保存 (验证损失: {best_val_loss:.4f})")
+        
         # 定期保存
         if (epoch + 1) % config.save_interval == 0:
-            checkpoint_filename = f"checkpoint_epoch{epoch+1}.pth"
-            save_checkpoint(epoch+1, model, optimizer, scheduler, avg_train_loss, avg_val_loss, 
-                           best_val_loss, config, os.path.join(config.checkpoint_dir, checkpoint_filename))
-
-    total_time = time.time() - state_manager.training_start_time
-    print(f"\n{'='*70}")
-    print(f"🎉 训练完成！")
-    print(f"{'='*70}")
-    print(f"⏱️  总用时: {format_time(total_time)}")
-    print(f"📊 最佳验证损失: {best_val_loss:.6f}")
-    print(f"📊 训练损失: {avg_train_loss:.6f}")
-    print(f"{'='*70}\n")
+            checkpoint_path = os.path.join(config.checkpoint_dir, f"checkpoint_epoch{epoch+1}.pth")
+            save_checkpoint(epoch+1, model, optimizer, scheduler, total_val_loss, best_val_loss, config, checkpoint_path)
     
-    writer.close()
+    print(f"\n{'='*80}")
+    print("🎉 训练完成！")
+    print(f"{'='*80}")
 
+# ==================== 工具函数 ====================
+def save_checkpoint(epoch, model, optimizer, scheduler, current_loss, best_loss, config, filename):
+    """保存检查点"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'current_loss': current_loss,
+        'best_loss': best_loss,
+        'config': config.__dict__,
+    }
+    torch.save(checkpoint, filename)
+    print(f"💾 检查点已保存: {filename}")
+
+def load_checkpoint(model, optimizer, scheduler, filename):
+    """加载检查点"""
+    checkpoint = torch.load(filename, map_location='cpu')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    best_loss = checkpoint['best_loss']
+    
+    print(f"✅ 检查点已加载: {filename}")
+    print(f"   从Epoch {start_epoch}开始继续训练")
+    print(f"   最佳验证损失: {best_loss:.6f}")
+    
+    return start_epoch, best_loss
+
+# ==================== 主函数 ====================
 def get_args():
-    parser = argparse.ArgumentParser(description='训练3D打印机PINN模型')
-    parser.add_argument('--data_path', type=str, default='enterprise_dataset/printer_enterprise_data.csv', 
+    parser = argparse.ArgumentParser(description='训练3D打印机多任务PINN模型')
+    parser.add_argument('--data_path', type=str, default='printer_dataset/nozzle_simulation_gear_print.csv',
                         help='数据文件路径')
-    parser.add_argument('--epochs', type=int, default=30, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=256, help='批次大小')
-    parser.add_argument('--lr', type=float, default=2e-4, help='学习率')
+    parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=128, help='批次大小')
+    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
     parser.add_argument('--resume_from', type=str, help='从指定检查点恢复训练')
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_seq2seq', help='检查点保存目录')
-    parser.add_argument('--save_on_exit', type=bool, default=True, help='退出时是否保存权重')
-    parser.add_argument('--save_interval', type=int, default=5, help='定期保存间隔')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_multitask', help='检查点保存目录')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='设备')
-    parser.add_argument('--load_optimizer_state', type=bool, default=True, 
-                        help='加载检查点时是否加载优化器状态（batch size变化时建议为False）')
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = get_args()
     config = Config()
     
-    # 更新配置参数
+    # 更新配置
     config.data_path = args.data_path
     config.epochs = args.epochs
     config.batch_size = args.batch_size
     config.lr = args.lr
     config.resume_from = args.resume_from
     config.checkpoint_dir = args.checkpoint_dir
-    config.save_on_exit = args.save_on_exit
-    config.save_interval = args.save_interval
     config.device = args.device
-    config.load_optimizer_state = args.load_optimizer_state
     
-    train_pinn_seq2seq(config)
+    train_multitask_pinn(config)
