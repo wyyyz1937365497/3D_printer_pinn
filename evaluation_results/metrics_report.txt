@@ -1,0 +1,42 @@
+Model Evaluation Report
+======================================================================
+
+Model Path: checkpoints_seq2seq/best_seq2seq_model.pth
+Samples Evaluated: 40000
+
+Feature: temperature_C
+  MSE: 0.000022
+  MAE: 0.003714
+  RMSE: 0.004674
+  R2: 0.000000
+
+Feature: vibration_disp_m
+  MSE: 0.000000
+  MAE: 0.000000
+  RMSE: 0.000000
+  R2: 0.962506
+
+Feature: vibration_vel_m_s
+  MSE: 0.000000
+  MAE: 0.000014
+  RMSE: 0.000016
+  R2: 0.964509
+
+Feature: motor_current_A
+  MSE: 0.000028
+  MAE: 0.004205
+  RMSE: 0.005247
+  R2: -30267772.000000
+
+Feature: pressure_bar
+  MSE: 0.010018
+  MAE: 0.079747
+  RMSE: 0.100089
+  R2: -0.000337
+
+Feature: acoustic_signal
+  MSE: 0.010610
+  MAE: 0.082167
+  RMSE: 0.103004
+  R2: 0.979173
+
